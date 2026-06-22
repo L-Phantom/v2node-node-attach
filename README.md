@@ -3,33 +3,33 @@
 Small helper script for appending or updating `Nodes` entries in
 `/etc/v2node/config.json`.
 
-It is designed to work with the official `v2node` installer. Install `v2node`
-first, then run this helper one or more times to attach extra production
-panels without manually editing JSON.
+It is designed to work with the official `v2node` installer. You can either run
+the full bootstrap command, or install `v2node` first and then run the attach
+helper one or more times.
 
 ## Usage
 
-Install official `v2node`:
+Full one-command install and attach:
 
 ```bash
-wget -N https://raw.githubusercontent.com/wyx2685/v2node/master/script/install.sh && bash install.sh
-```
-
-Attach one panel node:
-
-```bash
-wget -N https://raw.githubusercontent.com/YOUR_GITHUB_USER/v2node-node-attach/main/v2node-node-attach.sh
-bash v2node-node-attach.sh \
+wget -N https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-bootstrap.sh && bash v2node-bootstrap.sh \
   --api-host https://node.example.com \
   --node-id 6 \
   --api-key your-api-key
 ```
 
-Attach multiple panel nodes in one command:
+Full one-command install and attach multiple panel nodes:
 
 ```bash
-wget -N https://raw.githubusercontent.com/YOUR_GITHUB_USER/v2node-node-attach/main/v2node-node-attach.sh
-bash v2node-node-attach.sh \
+wget -N https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-bootstrap.sh && bash v2node-bootstrap.sh \
+  --node https://panel-a.example.com,1,aaa \
+  --node https://panel-b.example.com,2,bbb
+```
+
+Attach nodes only, when official `v2node` is already installed:
+
+```bash
+wget -N https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-node-attach.sh && bash v2node-node-attach.sh \
   --node https://panel-a.example.com,1,aaa \
   --node https://panel-b.example.com,2,bbb
 ```
@@ -44,4 +44,3 @@ updates the existing node entry instead of duplicating it.
   `/etc/v2node/config.json` and reloads on file changes.
 - Pass `--restart` if you want the helper to restart `v2node` explicitly.
 - Pass `--config /path/to/config.json` for testing or non-standard installs.
-
