@@ -8,6 +8,7 @@ INSTALL_V2NODE=0
 INSTALL_VERSION=""
 RESTART_V2NODE=0
 NODES=()
+AUTO_NODES=()
 ATTACH_ARGS=()
 FIRST_API_HOST=""
 FIRST_NODE_ID=""
@@ -16,12 +17,14 @@ FIRST_API_KEY=""
 usage() {
   cat <<'EOF'
 Usage:
+  v2node-443-mux.sh --node API_HOST,NODE_ID,API_KEY [--node ...]
   v2node-443-mux.sh --node SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY [--node ...]
 
 Options:
+  --node API_HOST,NODE_ID,API_KEY
+                         Recommended. Read SNI and service port from panel.
   --node SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY
-                         Add one SNI route and one v2node backend entry.
-                         LOCAL_PORT must match the panel service port.
+                         Manual fallback. LOCAL_PORT must match service port.
   --listen-port PORT     Public mux listen port. Defaults to 443.
   --install-v2node       Install/update upstream v2node before attaching nodes.
   --install-version VER  Install a specific upstream v2node version.
@@ -31,8 +34,8 @@ Options:
 Example:
   bash v2node-443-mux.sh \
     --install-v2node \
-    --node a.example.com,14431,https://panel-a.example.com,1,aaa \
-    --node b.example.com,14432,https://panel-b.example.com,2,bbb
+    --node https://panel-a.example.com,1,aaa \
+    --node https://panel-b.example.com,2,bbb
 EOF
 }
 
@@ -78,6 +81,14 @@ ensure_nginx() {
     echo "nginx not found, installing..."
     install_packages nginx
   fi
+}
+
+ensure_jq() {
+  if command -v jq >/dev/null 2>&1; then
+    return
+  fi
+  echo "jq not found, installing..."
+  install_packages jq
 }
 
 ensure_nginx_stream_module() {
@@ -134,6 +145,101 @@ validate_node_id() {
   printf '%s' "$value"
 }
 
+fetch_panel_config() {
+  local api_host="$1"
+  local node_id="$2"
+  local api_key="$3"
+  local output="$4"
+  local endpoint url
+
+  local endpoints=(
+    "/api/v1/server/UniProxy/config?node_id=$node_id&node_type=vless"
+    "/api/v1/server/UniProxy/config?node_id=$node_id"
+    "/api/v2/server/config?node_id=$node_id&node_type=vless"
+    "/api/v2/server/config?node_id=$node_id"
+    "/api/v1/server/VLess/config?node_id=$node_id"
+    "/api/v1/server/vless/config?node_id=$node_id"
+  )
+
+  for endpoint in "${endpoints[@]}"; do
+    url="${api_host}${endpoint}"
+    if curl -fsSL \
+      --connect-timeout 8 \
+      --max-time 20 \
+      -H "Authorization: $api_key" \
+      -H "X-Api-Key: $api_key" \
+      -H "X-Node-ID: $node_id" \
+      "$url" -o "$output" 2>/dev/null; then
+      if jq empty "$output" >/dev/null 2>&1; then
+        echo "Fetched node config: $endpoint" >&2
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+extract_config_sni() {
+  local file="$1"
+  jq -r '
+    [
+      .. | objects
+      | .serverName? // .server_name? // .sni? // .SNI? // .dest? // .Dest?
+    ]
+    | map(select(type == "string" and length > 0))
+    | map(split(":")[0])
+    | map(select(test("^[A-Za-z0-9._-]+$")))
+    | first // empty
+  ' "$file"
+}
+
+extract_config_port() {
+  local file="$1"
+  jq -r '
+    [
+      .. | objects
+      | .service_port? // .server_port? // .port? // .local_port? // .listen_port?
+        // .ServicePort? // .ServerPort? // .Port?
+    ]
+    | map(
+        if type == "number" then tostring
+        elif type == "string" then .
+        else empty end
+      )
+    | map(capture("(?<port>[0-9]{1,5})").port? // empty)
+    | map(select((tonumber >= 1) and (tonumber <= 65535)))
+    | first // empty
+  ' "$file"
+}
+
+discover_node_route() {
+  local api_host="$1"
+  local node_id="$2"
+  local api_key="$3"
+  local config_file sni local_port
+  config_file="$(mktemp)"
+
+  if ! fetch_panel_config "$api_host" "$node_id" "$api_key" "$config_file"; then
+    rm -f "$config_file"
+    die "cannot read node config from $api_host node $node_id; use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
+  fi
+
+  sni="$(extract_config_sni "$config_file")"
+  local_port="$(extract_config_port "$config_file")"
+  rm -f "$config_file"
+
+  [[ -n "$sni" ]] ||
+    die "cannot auto-detect Reality SNI for $api_host node $node_id; use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
+  [[ -n "$local_port" ]] ||
+    die "cannot auto-detect service port for $api_host node $node_id; use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
+
+  sni="$(validate_sni "$sni")"
+  local_port="$(validate_port "$local_port")"
+  NODES+=("$sni"$'\t'"$local_port"$'\t'"$api_host"$'\t'"$node_id"$'\t'"$api_key")
+  echo "Auto-detected route: $sni -> 127.0.0.1:$local_port ($api_host node $node_id)"
+}
+
 remember_first_node() {
   local api_host="$1"
   local node_id="$2"
@@ -147,21 +253,36 @@ remember_first_node() {
 
 parse_node_csv() {
   local raw="$1"
-  local sni local_port api_host node_id api_key
-  IFS=',' read -r sni local_port api_host node_id api_key <<< "$raw"
+  local parts_count sni local_port api_host node_id api_key
+  parts_count="$(awk -F',' '{print NF}' <<< "$raw")"
 
-  [[ -n "${sni:-}" && -n "${local_port:-}" && -n "${api_host:-}" && -n "${node_id:-}" && -n "${api_key:-}" ]] ||
-    die "--node expects SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY: $raw"
+  if [[ "$parts_count" -eq 3 ]]; then
+    IFS=',' read -r api_host node_id api_key <<< "$raw"
+    api_host="$(normalize_api_host "$api_host")"
+    node_id="$(validate_node_id "$node_id")"
+    [[ -n "$api_key" ]] || die "ApiKey is empty for $api_host node $node_id"
 
-  sni="$(validate_sni "$sni")"
-  local_port="$(validate_port "$local_port")"
-  api_host="$(normalize_api_host "$api_host")"
-  node_id="$(validate_node_id "$node_id")"
-  [[ -n "$api_key" ]] || die "ApiKey is empty for $api_host node $node_id"
+    AUTO_NODES+=("$api_host"$'\t'"$node_id"$'\t'"$api_key")
+    ATTACH_ARGS+=("--node" "$api_host,$node_id,$api_key")
+    remember_first_node "$api_host" "$node_id" "$api_key"
+    return
+  fi
 
-  NODES+=("$sni"$'\t'"$local_port"$'\t'"$api_host"$'\t'"$node_id"$'\t'"$api_key")
-  ATTACH_ARGS+=("--node" "$api_host,$node_id,$api_key")
-  remember_first_node "$api_host" "$node_id" "$api_key"
+  if [[ "$parts_count" -eq 5 ]]; then
+    IFS=',' read -r sni local_port api_host node_id api_key <<< "$raw"
+    sni="$(validate_sni "$sni")"
+    local_port="$(validate_port "$local_port")"
+    api_host="$(normalize_api_host "$api_host")"
+    node_id="$(validate_node_id "$node_id")"
+    [[ -n "$api_key" ]] || die "ApiKey is empty for $api_host node $node_id"
+
+    NODES+=("$sni"$'\t'"$local_port"$'\t'"$api_host"$'\t'"$node_id"$'\t'"$api_key")
+    ATTACH_ARGS+=("--node" "$api_host,$node_id,$api_key")
+    remember_first_node "$api_host" "$node_id" "$api_key"
+    return
+  fi
+
+  die "--node expects API_HOST,NODE_ID,API_KEY or SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY: $raw"
 }
 
 validate_routes() {
@@ -182,6 +303,14 @@ validate_routes() {
 
     seen_snis+="${sni}"$'\n'
     seen_ports+="${local_port}"$'\n'
+  done
+}
+
+discover_auto_nodes() {
+  local item api_host node_id api_key
+  for item in "${AUTO_NODES[@]}"; do
+    IFS=$'\t' read -r api_host node_id api_key <<< "$item"
+    discover_node_route "$api_host" "$node_id" "$api_key"
   done
 }
 
@@ -342,10 +471,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+need_root
+ensure_jq
+discover_auto_nodes
+
 [[ "${#NODES[@]}" -gt 0 ]] || die "no node was provided"
 validate_routes
-
-need_root
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT

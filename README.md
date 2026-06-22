@@ -47,15 +47,18 @@ an Nginx `stream` SNI router.
 ```bash
 wget -N https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-443-mux.sh && bash v2node-443-mux.sh \
   --install-v2node \
-  --node a.example.com,14431,https://panel-a.example.com,1,aaa \
-  --node b.example.com,14432,https://panel-b.example.com,2,bbb
+  --node https://panel-a.example.com,1,aaa \
+  --node https://panel-b.example.com,2,bbb
 ```
 
 Each `--node` value is:
 
 ```text
-SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY
+API_HOST,NODE_ID,API_KEY
 ```
+
+The script reads the Reality SNI and backend service port from the panel node
+config automatically.
 
 Panel requirements:
 
@@ -76,6 +79,15 @@ public :443
 ```
 
 If official `v2node` is already installed, remove `--install-v2node`.
+
+If your panel API is customized and auto-detection fails, use the manual
+fallback format:
+
+```bash
+bash v2node-443-mux.sh \
+  --node a.example.com,14431,https://panel-a.example.com,1,aaa \
+  --node b.example.com,14432,https://panel-b.example.com,2,bbb
+```
 
 ## Notes
 
