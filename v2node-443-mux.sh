@@ -123,6 +123,24 @@ find_nginx_stream_module() {
   find /usr /etc -path '*/nginx/modules/ngx_stream_module.so' -print -quit 2>/dev/null
 }
 
+dedupe_nginx_stream_module_links() {
+  local enabled_dir="/etc/nginx/modules-enabled"
+  local keep="" conf
+
+  [[ -d "$enabled_dir" ]] || return
+
+  for conf in "$enabled_dir"/*stream*.conf; do
+    [[ -e "$conf" ]] || continue
+    if grep -Eq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$conf" 2>/dev/null; then
+      if [[ -z "$keep" ]]; then
+        keep="$conf"
+      elif [[ -L "$conf" ]]; then
+        rm -f "$conf"
+      fi
+    fi
+  done
+}
+
 nginx_stream_module_declared() {
   local nginx_conf="/etc/nginx/nginx.conf"
 
@@ -149,12 +167,17 @@ enable_nginx_stream_module() {
 
   [[ -f "$nginx_conf" ]] || die "nginx config not found: $nginx_conf"
 
+  dedupe_nginx_stream_module_links
+
   if [[ -d /etc/nginx/modules-enabled ]]; then
-    for module_conf in /usr/share/nginx/modules-available/*stream*.conf /etc/nginx/modules-available/*stream*.conf; do
-      if [[ -f "$module_conf" ]]; then
-        ln -sf "$module_conf" "/etc/nginx/modules-enabled/$(basename "$module_conf")"
-      fi
-    done
+    if ! grep -REq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' /etc/nginx/modules-enabled 2>/dev/null; then
+      for module_conf in /usr/share/nginx/modules-available/*stream*.conf /etc/nginx/modules-available/*stream*.conf; do
+        if [[ -f "$module_conf" ]]; then
+          ln -sf "$module_conf" "/etc/nginx/modules-enabled/50-$(basename "$module_conf")"
+          break
+        fi
+      done
+    fi
   fi
 
   if nginx_stream_module_declared; then
