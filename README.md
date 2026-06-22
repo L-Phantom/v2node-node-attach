@@ -89,6 +89,10 @@ bash v2node-443-mux.sh \
   --node b.example.com,14432,https://panel-b.example.com,2,bbb
 ```
 
+For API detection diagnostics, add `--debug` or set `V2NODE_MUX_DEBUG=1`.
+The script prints endpoint/status/message summaries only; it does not print the
+full API key.
+
 ## Notes
 
 - The script backs up the old config before writing.

@@ -13,6 +13,8 @@ ATTACH_ARGS=()
 FIRST_API_HOST=""
 FIRST_NODE_ID=""
 FIRST_API_KEY=""
+DEBUG="${V2NODE_MUX_DEBUG:-0}"
+LAST_PANEL_ERROR=""
 
 usage() {
   cat <<'EOF'
@@ -29,6 +31,7 @@ Options:
   --install-v2node       Install/update upstream v2node before attaching nodes.
   --install-version VER  Install a specific upstream v2node version.
   --restart-v2node       Restart v2node after writing config.
+  --debug                Print safe panel API detection diagnostics.
   -h, --help             Show this help.
 
 Example:
@@ -145,36 +148,171 @@ validate_node_id() {
   printf '%s' "$value"
 }
 
+debug_enabled() {
+  [[ "$DEBUG" == "1" || "$DEBUG" == "true" || "$DEBUG" == "yes" ]]
+}
+
+panel_config_is_usable() {
+  local file="$1"
+  jq -e '
+    type == "object" and
+    (
+      [
+        .. | objects
+        | select(
+            has("protocol") or
+            has("server_port") or
+            has("service_port") or
+            has("tls_settings") or
+            has("network_settings") or
+            has("base_config") or
+            has("server_name") or
+            has("serverName") or
+            has("server_names") or
+            has("serverNames") or
+            has("reality_settings") or
+            has("realitySettings")
+          )
+      ] | length > 0
+    )
+  ' "$file" >/dev/null 2>&1
+}
+
+debug_panel_response() {
+  local label="$1"
+  local file="$2"
+
+  debug_enabled || return
+  jq -r --arg label "$label" '
+    def one_line:
+      tostring | gsub("[\r\n\t]+"; " ") | .[0:160];
+    "Debug: tried \($label)",
+    "Debug: top-level keys: \((keys_unsorted // []) | join(","))",
+    (if has("status") then "Debug: status: \(.status | one_line)" else empty end),
+    (if has("message") then "Debug: message: \(.message | one_line)" else empty end),
+    (if has("msg") then "Debug: msg: \(.msg | one_line)" else empty end),
+    (if has("error") then "Debug: error: \(.error | one_line)" else empty end)
+  ' "$file" >&2 2>/dev/null || true
+}
+
+remember_panel_error() {
+  local label="$1"
+  local file="$2"
+  local summary
+
+  summary="$(jq -r --arg label "$label" '
+    def one_line:
+      tostring | gsub("[\r\n\t]+"; " ") | .[0:180];
+    [
+      "endpoint=\($label)",
+      (if has("status") then "status=\(.status | one_line)" else empty end),
+      (if has("message") then "message=\(.message | one_line)" else empty end),
+      (if has("msg") then "msg=\(.msg | one_line)" else empty end),
+      (if has("error") then "error=\(.error | one_line)" else empty end)
+    ] | join(" ")
+  ' "$file" 2>/dev/null || true)"
+
+  [[ -n "$summary" ]] && LAST_PANEL_ERROR="$summary"
+}
+
+try_panel_config_request() {
+  local api_host="$1"
+  local node_id="$2"
+  local api_key="$3"
+  local output="$4"
+  local path="$5"
+  local node_type="$6"
+  local token_param="$7"
+  local auth_mode="$8"
+  local label="$9"
+  local url="${api_host}${path}"
+  local curl_args=(
+    -fsSL
+    --connect-timeout 8
+    --max-time 20
+    --get
+    -A "v2node go-resty (https://github.com/go-resty/resty)"
+    -H "Accept: application/json"
+  )
+
+  curl_args+=(--data-urlencode "node_id=$node_id")
+  [[ -n "$node_type" ]] && curl_args+=(--data-urlencode "node_type=$node_type")
+
+  case "$token_param" in
+    token) curl_args+=(--data-urlencode "token=$api_key") ;;
+    key) curl_args+=(--data-urlencode "key=$api_key") ;;
+    api_key) curl_args+=(--data-urlencode "api_key=$api_key") ;;
+    none) ;;
+  esac
+
+  case "$auth_mode" in
+    plain) curl_args+=(-H "Authorization: $api_key") ;;
+    bearer) curl_args+=(-H "Authorization: Bearer $api_key") ;;
+    x-api-key) curl_args+=(-H "X-Api-Key: $api_key") ;;
+    token-header) curl_args+=(-H "Token: $api_key") ;;
+    none) ;;
+  esac
+
+  curl_args+=(
+    -H "X-Node-ID: $node_id"
+    -H "X-Node-Type: ${node_type:-v2node}"
+  )
+
+  if curl "${curl_args[@]}" "$url" -o "$output" 2>/dev/null; then
+    if jq empty "$output" >/dev/null 2>&1; then
+      debug_panel_response "$label" "$output"
+      if panel_config_is_usable "$output"; then
+        echo "Fetched node config: $label" >&2
+        return 0
+      fi
+      remember_panel_error "$label" "$output"
+    fi
+  fi
+
+  return 1
+}
+
 fetch_panel_config() {
   local api_host="$1"
   local node_id="$2"
   local api_key="$3"
   local output="$4"
-  local endpoint url
+  local path
 
-  local endpoints=(
-    "/api/v1/server/UniProxy/config?node_id=$node_id&node_type=vless"
-    "/api/v1/server/UniProxy/config?node_id=$node_id"
-    "/api/v2/server/config?node_id=$node_id&node_type=vless"
-    "/api/v2/server/config?node_id=$node_id"
-    "/api/v1/server/VLess/config?node_id=$node_id"
-    "/api/v1/server/vless/config?node_id=$node_id"
-  )
+  # Match upstream v2node exactly: it calls /api/v2/server/config with these
+  # query params, not node_type=vless headers.
+  if try_panel_config_request \
+    "$api_host" "$node_id" "$api_key" "$output" \
+    "/api/v2/server/config" "v2node" "token" "none" \
+    "/api/v2/server/config?node_type=v2node&node_id=$node_id&token=***"; then
+    return 0
+  fi
 
-  for endpoint in "${endpoints[@]}"; do
-    url="${api_host}${endpoint}"
-    if curl -fsSL \
-      --connect-timeout 8 \
-      --max-time 20 \
-      -H "Authorization: $api_key" \
-      -H "X-Api-Key: $api_key" \
-      -H "X-Node-ID: $node_id" \
-      "$url" -o "$output" 2>/dev/null; then
-      if jq empty "$output" >/dev/null 2>&1; then
-        echo "Fetched node config: $endpoint" >&2
+  for path in \
+    "/api/v2/server/config" \
+    "/api/v1/server/UniProxy/config" \
+    "/api/v1/server/VLess/config" \
+    "/api/v1/server/vless/config"; do
+    for request in \
+      "v2node key none" \
+      "v2node api_key none" \
+      "vless token none" \
+      "vless key none" \
+      "v2node none plain" \
+      "v2node none bearer" \
+      "v2node none x-api-key" \
+      "v2node none token-header" \
+      "vless none plain" \
+      "vless none bearer" \
+      "vless none x-api-key"; do
+      read -r node_type token_param auth_mode <<< "$request"
+      if try_panel_config_request \
+        "$api_host" "$node_id" "$api_key" "$output" \
+        "$path" "$node_type" "$token_param" "$auth_mode" \
+        "$path?node_type=$node_type&node_id=$node_id&${token_param}=*** auth=$auth_mode"; then
         return 0
       fi
-    fi
+    done
   done
 
   return 1
@@ -193,7 +331,7 @@ extract_config_sni() {
           f
         end;
     def parse_json_strings:
-      walk(if type == "string" then (try fromjson catch .) else . end);
+      walk(if type == "string" then (. as $value | try fromjson catch $value) else . end);
     def clean_sni:
       tostring
       | split(",")[0]
@@ -202,7 +340,7 @@ extract_config_sni() {
     parse_json_strings as $root
     |
     [
-      $root.. | objects
+      $root | .. | objects
       | .serverName? // .server_name? // .server_name_sni? // .sni? // .SNI?
         // .dest? // .Dest? // .target? // .Target?
         // .reality_server_name? // .realityServerName?
@@ -229,11 +367,11 @@ extract_config_port() {
           f
         end;
     def parse_json_strings:
-      walk(if type == "string" then (try fromjson catch .) else . end);
+      walk(if type == "string" then (. as $value | try fromjson catch $value) else . end);
     parse_json_strings as $root
     |
     [
-      $root.. | objects
+      $root | .. | objects
       | .service_port? // .server_port? // .port? // .local_port? // .listen_port?
         // .ServicePort? // .ServerPort? // .Port? // .serverPort?
     ]
@@ -257,6 +395,9 @@ discover_node_route() {
 
   if ! fetch_panel_config "$api_host" "$node_id" "$api_key" "$config_file"; then
     rm -f "$config_file"
+    if [[ -n "$LAST_PANEL_ERROR" ]]; then
+      die "cannot read node config from $api_host node $node_id; last panel response: $LAST_PANEL_ERROR. Check ApiHost, NodeID and ApiKey, or use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
+    fi
     die "cannot read node config from $api_host node $node_id; use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
   fi
 
@@ -497,6 +638,9 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --restart-v2node)
       RESTART_V2NODE=1
+      shift ;;
+    --debug)
+      DEBUG=1
       shift ;;
     -h|--help)
       usage
