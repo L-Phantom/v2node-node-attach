@@ -102,12 +102,63 @@ ensure_curl() {
   install_packages curl
 }
 
-ensure_nginx_stream_module() {
-  if nginx -V 2>&1 | grep -q -- '--with-stream'; then
+nginx_has_builtin_stream() {
+  nginx -V 2>&1 | grep -q -- '--with-stream' &&
+    ! nginx -V 2>&1 | grep -q -- '--with-stream=dynamic'
+}
+
+find_nginx_stream_module() {
+  local module
+  for module in \
+    /usr/lib/nginx/modules/ngx_stream_module.so \
+    /usr/lib64/nginx/modules/ngx_stream_module.so \
+    /usr/share/nginx/modules/ngx_stream_module.so \
+    /etc/nginx/modules/ngx_stream_module.so; do
+    if [[ -f "$module" ]]; then
+      printf '%s' "$module"
+      return 0
+    fi
+  done
+
+  find /usr /etc -path '*/nginx/modules/ngx_stream_module.so' -print -quit 2>/dev/null
+}
+
+enable_nginx_stream_module() {
+  local nginx_conf="/etc/nginx/nginx.conf"
+  local module_path module_conf
+
+  [[ -f "$nginx_conf" ]] || die "nginx config not found: $nginx_conf"
+
+  if [[ -d /etc/nginx/modules-enabled ]]; then
+    for module_conf in /usr/share/nginx/modules-available/*stream*.conf /etc/nginx/modules-available/*stream*.conf; do
+      if [[ -f "$module_conf" ]]; then
+        ln -sf "$module_conf" "/etc/nginx/modules-enabled/$(basename "$module_conf")"
+      fi
+    done
+  fi
+
+  if grep -Eq '^[[:space:]]*(load_module[[:space:]]+.*ngx_stream_module\.so|include[[:space:]]+/etc/nginx/modules-enabled/\*\.conf;)' "$nginx_conf"; then
     return
   fi
 
-  if [[ -d /etc/nginx/modules-enabled ]] && ls /etc/nginx/modules-enabled/*stream*.conf >/dev/null 2>&1; then
+  module_path="$(find_nginx_stream_module)"
+  [[ -n "$module_path" ]] || return
+
+  cp "$nginx_conf" "$nginx_conf.bak.$(date +%Y%m%d%H%M%S)"
+  {
+    echo "load_module $module_path;"
+    cat "$nginx_conf"
+  } > "$nginx_conf.tmp.$$"
+  mv "$nginx_conf.tmp.$$" "$nginx_conf"
+}
+
+ensure_nginx_stream_module() {
+  if nginx_has_builtin_stream; then
+    return
+  fi
+
+  enable_nginx_stream_module
+  if nginx -t >/dev/null 2>&1; then
     return
   fi
 
@@ -122,6 +173,11 @@ ensure_nginx_stream_module() {
     install_packages nginx-mod-stream
   else
     die "nginx stream module is required, but no supported package manager was found"
+  fi
+
+  enable_nginx_stream_module
+  if ! nginx -t >/dev/null 2>&1; then
+    die "nginx stream module is installed but not loadable; run 'nginx -t' for details"
   fi
 }
 
@@ -692,8 +748,8 @@ trap 'rm -rf "$tmp_dir"' EXIT
 install_v2node_if_requested "$tmp_dir"
 run_attach_helper "$tmp_dir"
 ensure_nginx
-ensure_nginx_stream_module
 ensure_nginx_stream_include
+ensure_nginx_stream_module
 write_nginx_mux_config
 reload_nginx
 print_summary
