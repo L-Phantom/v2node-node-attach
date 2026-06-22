@@ -183,13 +183,35 @@ fetch_panel_config() {
 extract_config_sni() {
   local file="$1"
   jq -r '
+    def walk(f):
+      . as $in
+      | if type == "object" then
+          reduce keys[] as $key ({}; . + {($key): ($in[$key] | walk(f))}) | f
+        elif type == "array" then
+          map(walk(f)) | f
+        else
+          f
+        end;
+    def parse_json_strings:
+      walk(if type == "string" then (try fromjson catch .) else . end);
+    def clean_sni:
+      tostring
+      | split(",")[0]
+      | split(":")[0]
+      | gsub("^\\s+|\\s+$"; "");
+    parse_json_strings as $root
+    |
     [
-      .. | objects
-      | .serverName? // .server_name? // .sni? // .SNI? // .dest? // .Dest?
+      $root.. | objects
+      | .serverName? // .server_name? // .server_name_sni? // .sni? // .SNI?
+        // .dest? // .Dest? // .target? // .Target?
+        // .reality_server_name? // .realityServerName?
+        // .serverNames?[]? // .server_names?[]? // .server_names?
     ]
-    | map(select(type == "string" and length > 0))
-    | map(split(":")[0])
+    | map(select((type == "string" or type == "number") and (tostring | length > 0)))
+    | map(clean_sni)
     | map(select(test("^[A-Za-z0-9._-]+$")))
+    | map(select(test("[A-Za-z]")))
     | first // empty
   ' "$file"
 }
@@ -197,10 +219,23 @@ extract_config_sni() {
 extract_config_port() {
   local file="$1"
   jq -r '
+    def walk(f):
+      . as $in
+      | if type == "object" then
+          reduce keys[] as $key ({}; . + {($key): ($in[$key] | walk(f))}) | f
+        elif type == "array" then
+          map(walk(f)) | f
+        else
+          f
+        end;
+    def parse_json_strings:
+      walk(if type == "string" then (try fromjson catch .) else . end);
+    parse_json_strings as $root
+    |
     [
-      .. | objects
+      $root.. | objects
       | .service_port? // .server_port? // .port? // .local_port? // .listen_port?
-        // .ServicePort? // .ServerPort? // .Port?
+        // .ServicePort? // .ServerPort? // .Port? // .serverPort?
     ]
     | map(
         if type == "number" then tostring
