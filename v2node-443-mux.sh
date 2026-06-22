@@ -123,6 +123,26 @@ find_nginx_stream_module() {
   find /usr /etc -path '*/nginx/modules/ngx_stream_module.so' -print -quit 2>/dev/null
 }
 
+nginx_stream_module_declared() {
+  local nginx_conf="/etc/nginx/nginx.conf"
+
+  if grep -Eq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$nginx_conf"; then
+    return 0
+  fi
+
+  if grep -Eq '^[[:space:]]*include[[:space:]]+(/etc/nginx/)?modules-enabled/\*\.conf;' "$nginx_conf" &&
+    grep -REq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' /etc/nginx/modules-enabled 2>/dev/null; then
+    return 0
+  fi
+
+  if grep -Eq '^[[:space:]]*include[[:space:]]+/usr/share/nginx/modules/\*\.conf;' "$nginx_conf" &&
+    grep -REq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' /usr/share/nginx/modules 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
 enable_nginx_stream_module() {
   local nginx_conf="/etc/nginx/nginx.conf"
   local module_path module_conf
@@ -137,7 +157,7 @@ enable_nginx_stream_module() {
     done
   fi
 
-  if grep -Eq '^[[:space:]]*(load_module[[:space:]]+.*ngx_stream_module\.so|include[[:space:]]+/etc/nginx/modules-enabled/\*\.conf;)' "$nginx_conf"; then
+  if nginx_stream_module_declared; then
     return
   fi
 
@@ -152,13 +172,22 @@ enable_nginx_stream_module() {
   mv "$nginx_conf.tmp.$$" "$nginx_conf"
 }
 
+nginx_test() {
+  local output
+  if output="$(nginx -t 2>&1)"; then
+    return 0
+  fi
+  echo "$output" >&2
+  return 1
+}
+
 ensure_nginx_stream_module() {
   if nginx_has_builtin_stream; then
     return
   fi
 
   enable_nginx_stream_module
-  if nginx -t >/dev/null 2>&1; then
+  if nginx_test; then
     return
   fi
 
@@ -176,8 +205,8 @@ ensure_nginx_stream_module() {
   fi
 
   enable_nginx_stream_module
-  if ! nginx -t >/dev/null 2>&1; then
-    die "nginx stream module is installed but not loadable; run 'nginx -t' for details"
+  if ! nginx_test; then
+    die "nginx stream module is installed but not loadable; see nginx -t output above"
   fi
 }
 
