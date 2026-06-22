@@ -94,6 +94,14 @@ ensure_jq() {
   install_packages jq
 }
 
+ensure_curl() {
+  if command -v curl >/dev/null 2>&1; then
+    return
+  fi
+  echo "curl not found, installing..."
+  install_packages curl
+}
+
 ensure_nginx_stream_module() {
   if nginx -V 2>&1 | grep -q -- '--with-stream'; then
     return
@@ -195,6 +203,20 @@ debug_panel_response() {
   ' "$file" >&2 2>/dev/null || true
 }
 
+debug_panel_request_error() {
+  local label="$1"
+  local api_key="$2"
+  local file="$3"
+  local message
+
+  debug_enabled || return
+  message="$(tr '\n' ' ' < "$file" 2>/dev/null | cut -c 1-240 || true)"
+  message="${message//$api_key/***}"
+  [[ -n "$message" ]] || message="request failed before receiving a JSON response"
+  echo "Debug: request failed $label" >&2
+  echo "Debug: curl error: $message" >&2
+}
+
 remember_panel_error() {
   local label="$1"
   local file="$2"
@@ -226,6 +248,7 @@ try_panel_config_request() {
   local auth_mode="$8"
   local label="$9"
   local url="${api_host}${path}"
+  local curl_error
   local curl_args=(
     -fsSL
     --connect-timeout 8
@@ -258,7 +281,9 @@ try_panel_config_request() {
     -H "X-Node-Type: ${node_type:-v2node}"
   )
 
-  if curl "${curl_args[@]}" "$url" -o "$output" 2>/dev/null; then
+  curl_error="$(mktemp)"
+  if curl "${curl_args[@]}" "$url" -o "$output" 2>"$curl_error"; then
+    rm -f "$curl_error"
     if jq empty "$output" >/dev/null 2>&1; then
       debug_panel_response "$label" "$output"
       if panel_config_is_usable "$output"; then
@@ -267,8 +292,11 @@ try_panel_config_request() {
       fi
       remember_panel_error "$label" "$output"
     fi
+  else
+    debug_panel_request_error "$label" "$api_key" "$curl_error"
   fi
 
+  rm -f "$curl_error"
   return 1
 }
 
@@ -652,6 +680,7 @@ done
 
 need_root
 ensure_jq
+ensure_curl
 discover_auto_nodes
 
 [[ "${#NODES[@]}" -gt 0 ]] || die "no node was provided"
