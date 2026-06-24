@@ -269,6 +269,27 @@ nginx_test_reports_unknown_stream() {
   nginx -t 2>&1 | grep -q 'unknown directive "stream"'
 }
 
+nginx_supports_stream_context() {
+  local tmp_conf output
+  tmp_conf="$(mktemp)"
+  cat > "$tmp_conf" <<'EOF'
+events {}
+stream {
+    server {
+        listen 127.0.0.1:65535;
+        proxy_pass 127.0.0.1:1;
+    }
+}
+EOF
+  if output="$(nginx -t -c "$tmp_conf" 2>&1)"; then
+    rm -f "$tmp_conf"
+    return 0
+  fi
+  rm -f "$tmp_conf"
+  [[ "$output" == *'unknown directive "stream"'* ]] && return 1
+  return 1
+}
+
 disable_generated_stream_include_for_repair() {
   local nginx_conf="/etc/nginx/nginx.conf"
 
@@ -316,20 +337,20 @@ disable_generated_stream_include_for_repair() {
 ensure_nginx_stream_module() {
   echo "Ensuring nginx stream module..."
 
-  if nginx_has_builtin_stream; then
-    echo "nginx stream module is built in."
-    return 0
-  fi
-
-  enable_nginx_stream_module
-  if nginx_test; then
-    echo "nginx stream module is already loadable."
+  if nginx_supports_stream_context; then
+    echo "nginx stream context is already supported."
     return 0
   fi
 
   if nginx_test_reports_unknown_stream; then
     echo "Repairing nginx.conf before loading stream module..."
     disable_generated_stream_include_for_repair
+  fi
+
+  enable_nginx_stream_module
+  if nginx_supports_stream_context; then
+    echo "nginx stream module is already loadable."
+    return 0
   fi
 
   echo "nginx stream module not detected, installing..."
@@ -346,8 +367,9 @@ ensure_nginx_stream_module() {
   fi
 
   enable_nginx_stream_module
-  if ! nginx_test; then
-    die "nginx stream module is installed but not loadable; see nginx -t output above"
+  if ! nginx_supports_stream_context; then
+    nginx -V 2>&1 >&2 || true
+    die "nginx stream module is installed but stream context is still not supported"
   fi
   echo "nginx stream module installed and loadable."
 }
