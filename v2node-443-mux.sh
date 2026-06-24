@@ -93,8 +93,36 @@ install_packages() {
     dnf install -y "${packages[@]}" >/dev/null
   elif command -v apk >/dev/null 2>&1; then
     apk add --no-cache "${packages[@]}" >/dev/null
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm --needed "${packages[@]}" >/dev/null
   else
     die "no supported package manager was found"
+  fi
+}
+
+ensure_base_packages() {
+  local packages=()
+  local package
+
+  for package in ca-certificates curl wget git; do
+    case "$package" in
+      ca-certificates)
+        command -v update-ca-certificates >/dev/null 2>&1 && continue
+        [[ -d /etc/ssl/certs ]] && continue
+        ;;
+      *)
+        command -v "$package" >/dev/null 2>&1 && continue
+        ;;
+    esac
+    packages+=("$package")
+  done
+
+  [[ "${#packages[@]}" -eq 0 ]] && return
+
+  echo "Installing base packages: ${packages[*]}..."
+  install_packages "${packages[@]}"
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    update-ca-certificates >/dev/null 2>&1 || true
   fi
 }
 
@@ -806,6 +834,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 need_root
+ensure_base_packages
 ensure_jq
 ensure_curl
 discover_auto_nodes

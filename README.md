@@ -9,6 +9,22 @@ helper one or more times.
 
 ## Usage
 
+Clean VPS first-run preparation:
+
+```bash
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -y && apt-get install -y ca-certificates curl wget git
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y ca-certificates curl wget git
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y ca-certificates curl wget git
+elif command -v apk >/dev/null 2>&1; then
+  apk add --no-cache ca-certificates curl wget git
+elif command -v pacman >/dev/null 2>&1; then
+  pacman -Sy --noconfirm --needed ca-certificates curl wget git
+fi
+```
+
 Full one-command install and attach:
 
 ```bash
@@ -45,7 +61,20 @@ modify `v2node`; it installs/updates `v2node`, appends node entries, and writes
 an Nginx `stream` SNI router.
 
 ```bash
-wget -N https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-443-mux.sh && bash v2node-443-mux.sh \
+wget -O v2node-443-mux.sh https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-443-mux.sh && bash v2node-443-mux.sh \
+  --install-v2node \
+  --node https://panel-a.example.com,1,aaa \
+  --node https://panel-b.example.com,2,bbb
+```
+
+Do not append `--install-v2node` or `--node` directly after `wget`. Those are
+script arguments and must come after `&& bash v2node-443-mux.sh`.
+
+Clean VPS full command:
+
+```bash
+if command -v apt-get >/dev/null 2>&1; then apt-get update -y && apt-get install -y ca-certificates curl wget git; elif command -v yum >/dev/null 2>&1; then yum install -y ca-certificates curl wget git; elif command -v dnf >/dev/null 2>&1; then dnf install -y ca-certificates curl wget git; elif command -v apk >/dev/null 2>&1; then apk add --no-cache ca-certificates curl wget git; elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm --needed ca-certificates curl wget git; fi
+wget -O v2node-443-mux.sh https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-443-mux.sh && bash v2node-443-mux.sh \
   --install-v2node \
   --node https://panel-a.example.com,1,aaa \
   --node https://panel-b.example.com,2,bbb
