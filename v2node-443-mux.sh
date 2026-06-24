@@ -47,6 +47,25 @@ die() {
   exit 1
 }
 
+die_local_port_conflicts_with_public_port() {
+  local sni="$1"
+  local local_port="$2"
+
+  cat >&2 <<EOF
+Error: backend service port for $sni is $local_port, but public mux listen port is also $LISTEN_PORT.
+
+Nginx owns the public $LISTEN_PORT for SNI multiplexing, so every v2node backend must
+listen on a different local service port, for example 10010, 10011, 14431.
+
+Fix this in the panel node settings:
+  - client/connect/public port can stay $LISTEN_PORT
+  - backend service/listen port must be changed from $local_port to a non-$LISTEN_PORT port
+
+Then run this script again.
+EOF
+  exit 1
+}
+
 need_root() {
   [[ "${EUID}" -eq 0 ]] || die "please run as root"
 }
@@ -603,7 +622,7 @@ validate_routes() {
     IFS=$'\t' read -r sni local_port api_host node_id api_key <<< "$item"
 
     if [[ "$local_port" == "$LISTEN_PORT" ]]; then
-      die "LOCAL_PORT must not equal public listen port $LISTEN_PORT: $sni"
+      die_local_port_conflicts_with_public_port "$sni" "$local_port"
     fi
 
     case $'\n'"$seen_snis"$'\n' in
