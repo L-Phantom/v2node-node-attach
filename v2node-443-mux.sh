@@ -251,6 +251,53 @@ nginx_test() {
   return 1
 }
 
+nginx_test_reports_unknown_stream() {
+  nginx -t 2>&1 | grep -q 'unknown directive "stream"'
+}
+
+disable_generated_stream_include_for_repair() {
+  local nginx_conf="/etc/nginx/nginx.conf"
+
+  [[ -f "$nginx_conf" ]] || return
+  if ! grep -q 'include /etc/nginx/stream.d/\*.conf;' "$nginx_conf"; then
+    return
+  fi
+
+  cp "$nginx_conf" "$nginx_conf.bak.disable-stream.$(date +%Y%m%d%H%M%S)"
+  awk '
+    /^[[:space:]]*stream[[:space:]]*\{[[:space:]]*$/ {
+      buffer = $0 ORS
+      depth = 1
+      in_stream = 1
+      has_include = 0
+      next
+    }
+    in_stream {
+      buffer = buffer $0 ORS
+      if ($0 ~ /include[[:space:]]+\/etc\/nginx\/stream\.d\/\*\.conf;/) {
+        has_include = 1
+      }
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (depth <= 0) {
+        if (!has_include) {
+          printf "%s", buffer
+        }
+        buffer = ""
+        in_stream = 0
+      }
+      next
+    }
+    { print }
+    END {
+      if (in_stream && !has_include) {
+        printf "%s", buffer
+      }
+    }
+  ' "$nginx_conf" > "$nginx_conf.tmp.$$"
+  mv "$nginx_conf.tmp.$$" "$nginx_conf"
+}
+
 ensure_nginx_stream_module() {
   if nginx_has_builtin_stream; then
     return
@@ -259,6 +306,11 @@ ensure_nginx_stream_module() {
   enable_nginx_stream_module
   if nginx_test; then
     return
+  fi
+
+  if nginx_test_reports_unknown_stream; then
+    echo "Repairing nginx.conf before loading stream module..."
+    disable_generated_stream_include_for_repair
   fi
 
   echo "nginx stream module not detected, installing..."
@@ -960,8 +1012,8 @@ trap 'rm -rf "$tmp_dir"' EXIT
 install_v2node_if_requested "$tmp_dir"
 run_attach_helper "$tmp_dir"
 ensure_nginx
-ensure_nginx_stream_include
 ensure_nginx_stream_module
+ensure_nginx_stream_include
 write_nginx_mux_config
 reload_nginx
 print_summary
