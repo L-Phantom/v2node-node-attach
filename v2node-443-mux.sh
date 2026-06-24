@@ -859,6 +859,45 @@ reload_nginx() {
   fi
 }
 
+listening_on_port() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn "( sport = :$port )" 2>/dev/null | awk 'NR > 1 { found=1 } END { exit found ? 0 : 1 }'
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk -v port=":$port" '$4 ~ port "$" { found=1 } END { exit found ? 0 : 1 }'
+  else
+    return 2
+  fi
+}
+
+print_runtime_checks() {
+  local item sni local_port api_host node_id api_key failed=0
+
+  echo
+  echo "Runtime checks:"
+  if listening_on_port "$LISTEN_PORT"; then
+    echo "  OK public :$LISTEN_PORT is listening"
+  else
+    echo "  WARN public :$LISTEN_PORT is not listening; check nginx -t and systemctl status nginx"
+    failed=1
+  fi
+
+  for item in "${NODES[@]}"; do
+    IFS=$'\t' read -r sni local_port api_host node_id api_key <<< "$item"
+    if listening_on_port "$local_port"; then
+      echo "  OK backend 127.0.0.1:$local_port is listening for $sni"
+    else
+      echo "  WARN backend 127.0.0.1:$local_port is not listening for $sni; check v2node logs and panel service port"
+      failed=1
+    fi
+  done
+
+  if [[ "$failed" -eq 1 ]]; then
+    echo
+    echo "A process can be running while the route is still broken. The warnings above show which port is missing."
+  fi
+}
+
 print_summary() {
   local item sni local_port api_host node_id api_key
   echo
@@ -872,6 +911,7 @@ print_summary() {
   echo
   echo "Panel requirement: each backend node service port must match its LOCAL_PORT,"
   echo "while the client/connect port can stay $LISTEN_PORT."
+  print_runtime_checks
 }
 
 while [[ $# -gt 0 ]]; do
