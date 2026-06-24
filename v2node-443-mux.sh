@@ -182,6 +182,33 @@ find_nginx_stream_module() {
   find /usr /etc -path '*/nginx/modules/ngx_stream_module.so' -print -quit 2>/dev/null
 }
 
+write_nginx_stream_module_loads() {
+  local module_path module_conf
+
+  if nginx_has_builtin_stream; then
+    return 0
+  fi
+
+  module_path="$(find_nginx_stream_module)"
+  if [[ -n "$module_path" ]]; then
+    echo "load_module $module_path;"
+    return 0
+  fi
+
+  for module_conf in \
+    /etc/nginx/modules-enabled/*stream*.conf \
+    /usr/share/nginx/modules-enabled/*stream*.conf \
+    /usr/share/nginx/modules-available/*stream*.conf \
+    /etc/nginx/modules-available/*stream*.conf \
+    /usr/share/nginx/modules/*stream*.conf; do
+    [[ -f "$module_conf" ]] || continue
+    if grep -Eq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$module_conf"; then
+      grep -E '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$module_conf"
+      return 0
+    fi
+  done
+}
+
 dedupe_nginx_stream_module_links() {
   local enabled_dir="/etc/nginx/modules-enabled"
   local keep="" conf
@@ -272,8 +299,12 @@ nginx_test_reports_unknown_stream() {
 nginx_supports_stream_context() {
   local tmp_conf output
   tmp_conf="$(mktemp)"
-  cat > "$tmp_conf" <<'EOF'
-events {}
+  {
+    write_nginx_stream_module_loads
+    cat <<'EOF'
+events {
+    worker_connections 16;
+}
 stream {
     server {
         listen 127.0.0.1:65535;
@@ -281,6 +312,7 @@ stream {
     }
 }
 EOF
+  } > "$tmp_conf"
   if output="$(nginx -t -c "$tmp_conf" 2>&1)"; then
     rm -f "$tmp_conf"
     return 0
