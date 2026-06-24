@@ -174,7 +174,7 @@ dedupe_nginx_stream_module_links() {
   local enabled_dir="/etc/nginx/modules-enabled"
   local keep="" conf
 
-  [[ -d "$enabled_dir" ]] || return
+  [[ -d "$enabled_dir" ]] || return 0
 
   for conf in "$enabled_dir"/*stream*.conf; do
     [[ -e "$conf" ]] || continue
@@ -186,6 +186,8 @@ dedupe_nginx_stream_module_links() {
       fi
     fi
   done
+
+  return 0
 }
 
 nginx_stream_module_declared() {
@@ -232,7 +234,7 @@ enable_nginx_stream_module() {
   fi
 
   module_path="$(find_nginx_stream_module)"
-  [[ -n "$module_path" ]] || return
+  [[ -n "$module_path" ]] || return 0
 
   cp "$nginx_conf" "$nginx_conf.bak.$(date +%Y%m%d%H%M%S)"
   {
@@ -258,9 +260,9 @@ nginx_test_reports_unknown_stream() {
 disable_generated_stream_include_for_repair() {
   local nginx_conf="/etc/nginx/nginx.conf"
 
-  [[ -f "$nginx_conf" ]] || return
+  [[ -f "$nginx_conf" ]] || return 0
   if ! grep -q 'include /etc/nginx/stream.d/\*.conf;' "$nginx_conf"; then
-    return
+    return 0
   fi
 
   cp "$nginx_conf" "$nginx_conf.bak.disable-stream.$(date +%Y%m%d%H%M%S)"
@@ -296,15 +298,20 @@ disable_generated_stream_include_for_repair() {
     }
   ' "$nginx_conf" > "$nginx_conf.tmp.$$"
   mv "$nginx_conf.tmp.$$" "$nginx_conf"
+  return 0
 }
 
 ensure_nginx_stream_module() {
+  echo "Ensuring nginx stream module..."
+
   if nginx_has_builtin_stream; then
+    echo "nginx stream module is built in."
     return
   fi
 
   enable_nginx_stream_module
   if nginx_test; then
+    echo "nginx stream module is already loadable."
     return
   fi
 
@@ -330,6 +337,7 @@ ensure_nginx_stream_module() {
   if ! nginx_test; then
     die "nginx stream module is installed but not loadable; see nginx -t output above"
   fi
+  echo "nginx stream module installed and loadable."
 }
 
 validate_sni() {
@@ -846,6 +854,8 @@ run_attach_helper() {
 ensure_nginx_stream_include() {
   local nginx_conf="/etc/nginx/nginx.conf"
   local stream_dir="/etc/nginx/stream.d"
+
+  echo "Ensuring nginx stream include..."
   mkdir -p "$stream_dir"
 
   [[ -f "$nginx_conf" ]] || die "nginx config not found: $nginx_conf"
@@ -874,6 +884,7 @@ write_nginx_mux_config() {
   local first_backend=""
   local item sni local_port api_host node_id api_key
 
+  echo "Writing nginx mux config..."
   for item in "${NODES[@]}"; do
     IFS=$'\t' read -r sni local_port api_host node_id api_key <<< "$item"
     first_backend="${first_backend:-127.0.0.1:$local_port}"
@@ -900,6 +911,7 @@ write_nginx_mux_config() {
 }
 
 reload_nginx() {
+  echo "Reloading nginx..."
   nginx -t
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable nginx >/dev/null 2>&1 || true
