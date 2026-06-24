@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+on_error() {
+  local exit_code="$?"
+  local line_no="${BASH_LINENO[0]:-${LINENO}}"
+  local command="${BASH_COMMAND:-unknown}"
+
+  echo "Error: v2node-443-mux.sh failed at line $line_no: $command (exit $exit_code)" >&2
+  echo "If this looks like a script bug, rerun with --debug and send the last 30 lines." >&2
+  exit "$exit_code"
+}
+
+trap on_error ERR
 
 INSTALL_URL="https://raw.githubusercontent.com/wyx2685/v2node/master/script/install.sh"
 ATTACH_URL="https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-node-attach.sh"
@@ -135,7 +147,7 @@ ensure_nginx() {
 
 ensure_jq() {
   if command -v jq >/dev/null 2>&1; then
-    return
+    return 0
   fi
   echo "jq not found, installing..."
   install_packages jq
@@ -143,7 +155,7 @@ ensure_jq() {
 
 ensure_curl() {
   if command -v curl >/dev/null 2>&1; then
-    return
+    return 0
   fi
   echo "curl not found, installing..."
   install_packages curl
@@ -230,7 +242,7 @@ enable_nginx_stream_module() {
   fi
 
   if nginx_stream_module_declared; then
-    return
+    return 0
   fi
 
   module_path="$(find_nginx_stream_module)"
@@ -306,13 +318,13 @@ ensure_nginx_stream_module() {
 
   if nginx_has_builtin_stream; then
     echo "nginx stream module is built in."
-    return
+    return 0
   fi
 
   enable_nginx_stream_module
   if nginx_test; then
     echo "nginx stream module is already loadable."
-    return
+    return 0
   fi
 
   if nginx_test_reports_unknown_stream; then
@@ -405,7 +417,7 @@ debug_panel_response() {
   local label="$1"
   local file="$2"
 
-  debug_enabled || return
+  debug_enabled || return 0
   jq -r --arg label "$label" '
     def one_line:
       tostring | gsub("[\r\n\t]+"; " ") | .[0:160];
@@ -424,7 +436,7 @@ debug_panel_request_error() {
   local file="$3"
   local message
 
-  debug_enabled || return
+  debug_enabled || return 0
   message="$(tr '\n' ' ' < "$file" 2>/dev/null | cut -c 1-240 || true)"
   message="${message//$api_key/***}"
   [[ -n "$message" ]] || message="request failed before receiving a JSON response"
@@ -756,7 +768,7 @@ parse_node_csv() {
     AUTO_NODES+=("$api_host"$'\t'"$node_id"$'\t'"$api_key")
     ATTACH_ARGS+=("--node" "$api_host,$node_id,$api_key")
     remember_first_node "$api_host" "$node_id" "$api_key"
-    return
+    return 0
   fi
 
   if [[ "$parts_count" -eq 5 ]]; then
@@ -770,7 +782,7 @@ parse_node_csv() {
     NODES+=("$sni"$'\t'"$local_port"$'\t'"$api_host"$'\t'"$node_id"$'\t'"$api_key")
     ATTACH_ARGS+=("--node" "$api_host,$node_id,$api_key")
     remember_first_node "$api_host" "$node_id" "$api_key"
-    return
+    return 0
   fi
 
   die "--node expects API_HOST,NODE_ID,API_KEY or SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY: $raw"
@@ -806,7 +818,10 @@ discover_auto_nodes() {
 }
 
 install_v2node_if_requested() {
-  [[ "$INSTALL_V2NODE" -eq 1 ]] || return
+  if [[ "$INSTALL_V2NODE" -ne 1 ]]; then
+    echo "Skipping official v2node install/update; --install-v2node was not provided."
+    return 0
+  fi
   [[ -n "$FIRST_API_HOST" && -n "$FIRST_NODE_ID" && -n "$FIRST_API_KEY" ]] ||
     die "cannot determine first node for non-interactive upstream install"
 
@@ -867,7 +882,7 @@ ensure_nginx_stream_include() {
       echo "    include /etc/nginx/stream.d/*.conf;" >&2
       exit 1
     fi
-    return
+    return 0
   fi
 
   cp "$nginx_conf" "$nginx_conf.bak.$(date +%Y%m%d%H%M%S)"
