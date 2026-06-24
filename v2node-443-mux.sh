@@ -539,6 +539,73 @@ extract_config_sni() {
 
 extract_config_port() {
   local file="$1"
+  local listen_port="${2:-443}"
+  jq -r --arg listen_port "$listen_port" '
+    def walk(f):
+      . as $in
+      | if type == "object" then
+          reduce keys[] as $key ({}; . + {($key): ($in[$key] | walk(f))}) | f
+        elif type == "array" then
+          map(walk(f)) | f
+        else
+          f
+        end;
+    def parse_json_strings:
+      walk(if type == "string" then (. as $value | try fromjson catch $value) else . end);
+    def port_value:
+      if type == "number" then tostring
+      elif type == "string" then (capture("(?<port>[0-9]{1,5})").port? // empty)
+      else empty end;
+    def valid_port:
+      select(length > 0)
+      | select((tonumber >= 1) and (tonumber <= 65535));
+    parse_json_strings as $root
+    |
+    (
+      [
+        $root | .. | objects
+        | .service_port? // .local_port? // .listen_port? // .ServicePort? // .LocalPort? // .ListenPort?
+      ]
+      | map(port_value | valid_port)
+      | map(select(. != $listen_port))
+      | first
+    ) //
+    (
+      [
+        $root | .. | objects
+        | .servicePort? // .backend_port? // .backendPort? // .BackendPort? // .target_port? // .targetPort?
+      ]
+      | map(port_value | valid_port)
+      | map(select(. != $listen_port))
+      | first
+    ) //
+    (
+      [
+        $root | .. | objects
+        | .service_port? // .local_port? // .listen_port? // .ServicePort? // .LocalPort? // .ListenPort?
+          // .servicePort? // .backend_port? // .backendPort? // .BackendPort? // .target_port? // .targetPort?
+          // .server_port? // .port? // .ServerPort? // .Port? // .serverPort?
+      ]
+      | map(port_value | valid_port)
+      | map(select(. != $listen_port))
+      | first
+    ) //
+    (
+      [
+        $root | .. | objects
+        | .service_port? // .local_port? // .listen_port? // .ServicePort? // .LocalPort? // .ListenPort?
+          // .servicePort? // .backend_port? // .backendPort? // .BackendPort? // .target_port? // .targetPort?
+          // .server_port? // .port? // .ServerPort? // .Port? // .serverPort?
+      ]
+      | map(port_value | valid_port)
+      | first
+    ) //
+    empty
+  ' "$file"
+}
+
+extract_config_public_port_candidates() {
+  local file="$1"
   jq -r '
     def walk(f):
       . as $in
@@ -551,21 +618,22 @@ extract_config_port() {
         end;
     def parse_json_strings:
       walk(if type == "string" then (. as $value | try fromjson catch $value) else . end);
+    def port_value:
+      if type == "number" then tostring
+      elif type == "string" then (capture("(?<port>[0-9]{1,5})").port? // empty)
+      else empty end;
+    def valid_port:
+      select(length > 0)
+      | select((tonumber >= 1) and (tonumber <= 65535));
     parse_json_strings as $root
     |
     [
       $root | .. | objects
-      | .service_port? // .server_port? // .port? // .local_port? // .listen_port?
-        // .ServicePort? // .ServerPort? // .Port? // .serverPort?
+      | .server_port? // .port? // .ServerPort? // .Port? // .serverPort?
     ]
-    | map(
-        if type == "number" then tostring
-        elif type == "string" then .
-        else empty end
-      )
-    | map(capture("(?<port>[0-9]{1,5})").port? // empty)
-    | map(select((tonumber >= 1) and (tonumber <= 65535)))
-    | first // empty
+    | map(port_value | valid_port)
+    | unique
+    | join(",")
   ' "$file"
 }
 
@@ -573,7 +641,7 @@ discover_node_route() {
   local api_host="$1"
   local node_id="$2"
   local api_key="$3"
-  local config_file sni local_port
+  local config_file sni local_port public_port_candidates
   config_file="$(mktemp)"
 
   if ! fetch_panel_config "$api_host" "$node_id" "$api_key" "$config_file"; then
@@ -585,7 +653,8 @@ discover_node_route() {
   fi
 
   sni="$(extract_config_sni "$config_file")"
-  local_port="$(extract_config_port "$config_file")"
+  local_port="$(extract_config_port "$config_file" "$LISTEN_PORT")"
+  public_port_candidates="$(extract_config_public_port_candidates "$config_file")"
   rm -f "$config_file"
 
   [[ -n "$sni" ]] ||
@@ -595,6 +664,9 @@ discover_node_route() {
 
   sni="$(validate_sni "$sni")"
   local_port="$(validate_port "$local_port")"
+  if [[ "$local_port" != "$LISTEN_PORT" && ",$public_port_candidates," == *",$LISTEN_PORT,"* ]]; then
+    echo "Detected public/connect port $LISTEN_PORT and backend service port $local_port for $sni" >&2
+  fi
   NODES+=("$sni"$'\t'"$local_port"$'\t'"$api_host"$'\t'"$node_id"$'\t'"$api_key")
   echo "Auto-detected route: $sni -> 127.0.0.1:$local_port ($api_host node $node_id)"
 }
