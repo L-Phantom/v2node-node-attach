@@ -1,32 +1,31 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-on_error() {
-  local exit_code="$?"
-  local line_no="${BASH_LINENO[0]:-${LINENO}}"
-  local command="${BASH_COMMAND:-unknown}"
-
-  echo "Error: v2node-443-mux.sh failed at line $line_no: $command (exit $exit_code)" >&2
-  echo "If this looks like a script bug, rerun with --debug and send the last 30 lines." >&2
-  exit "$exit_code"
-}
-
-trap on_error ERR
-
 INSTALL_URL="https://raw.githubusercontent.com/wyx2685/v2node/master/script/install.sh"
 ATTACH_URL="https://raw.githubusercontent.com/L-Phantom/v2node-node-attach/main/v2node-node-attach.sh"
+CONFIG="/etc/v2node/config.json"
 LISTEN_PORT="443"
 INSTALL_V2NODE=0
 INSTALL_VERSION=""
 RESTART_V2NODE=0
+DEBUG="${V2NODE_MUX_DEBUG:-0}"
+
 NODES=()
 AUTO_NODES=()
 ATTACH_ARGS=()
 FIRST_API_HOST=""
 FIRST_NODE_ID=""
 FIRST_API_KEY=""
-DEBUG="${V2NODE_MUX_DEBUG:-0}"
 LAST_PANEL_ERROR=""
+
+on_error() {
+  local code="$?"
+  local line="${BASH_LINENO[0]:-${LINENO}}"
+  local cmd="${BASH_COMMAND:-unknown}"
+  echo "Error: v2node-443-mux.sh failed at line $line: $cmd (exit $code)" >&2
+  exit "$code"
+}
+trap on_error ERR
 
 usage() {
   cat <<'EOF'
@@ -36,21 +35,15 @@ Usage:
 
 Options:
   --node API_HOST,NODE_ID,API_KEY
-                         Recommended. Read SNI and service port from panel.
+                         Read Reality SNI and backend service port from panel.
   --node SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY
-                         Manual fallback. LOCAL_PORT must match service port.
-  --listen-port PORT     Public mux listen port. Defaults to 443.
-  --install-v2node       Install/update upstream v2node before attaching nodes.
-  --install-version VER  Install a specific upstream v2node version.
+                         Manual fallback. LOCAL_PORT is v2node backend port.
+  --listen-port PORT     Public Nginx listen port. Defaults to 443.
+  --install-v2node       Install/update official v2node before attaching nodes.
+  --install-version VER  Install a specific official v2node version.
   --restart-v2node       Restart v2node after writing config.
-  --debug                Print safe panel API detection diagnostics.
+  --debug                Print safe panel API diagnostics.
   -h, --help             Show this help.
-
-Example:
-  bash v2node-443-mux.sh \
-    --install-v2node \
-    --node https://panel-a.example.com,1,aaa \
-    --node https://panel-b.example.com,2,bbb
 EOF
 }
 
@@ -59,27 +52,39 @@ die() {
   exit 1
 }
 
-die_local_port_conflicts_with_public_port() {
-  local sni="$1"
-  local local_port="$2"
-
-  cat >&2 <<EOF
-Error: backend service port for $sni is $local_port, but public mux listen port is also $LISTEN_PORT.
-
-Nginx owns the public $LISTEN_PORT for SNI multiplexing, so every v2node backend must
-listen on a different local service port, for example 10010, 10011, 14431.
-
-Fix this in the panel node settings:
-  - client/connect/public port can stay $LISTEN_PORT
-  - backend service/listen port must be changed from $local_port to a non-$LISTEN_PORT port
-
-Then run this script again.
-EOF
-  exit 1
-}
-
 need_root() {
   [[ "${EUID}" -eq 0 ]] || die "please run as root"
+}
+
+validate_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "port must be a number: $value"
+  (( value >= 1 && value <= 65535 )) || die "port out of range: $value"
+  printf '%s' "$value"
+}
+
+validate_sni() {
+  local value="$1"
+  [[ -n "$value" ]] || die "SNI is empty"
+  [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid SNI: $value"
+  printf '%s' "$value"
+}
+
+normalize_api_host() {
+  local value="$1"
+  value="${value%/}"
+  [[ -n "$value" ]] || die "ApiHost is empty"
+  case "$value" in
+    http://*|https://*) ;;
+    *) die "ApiHost must start with http:// or https://: $value" ;;
+  esac
+  printf '%s' "$value"
+}
+
+validate_node_id() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "NodeID must be a number: $value"
+  printf '%s' "$value"
 }
 
 download() {
@@ -112,400 +117,47 @@ install_packages() {
   fi
 }
 
+ensure_command() {
+  local command_name="$1"
+  local package_name="${2:-$1}"
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "$command_name not found, installing..."
+  install_packages "$package_name"
+}
+
 ensure_base_packages() {
-  local packages=()
-  local package
-
-  for package in ca-certificates curl wget git; do
-    case "$package" in
-      ca-certificates)
-        command -v update-ca-certificates >/dev/null 2>&1 && continue
-        [[ -d /etc/ssl/certs ]] && continue
-        ;;
-      *)
-        command -v "$package" >/dev/null 2>&1 && continue
-        ;;
-    esac
-    packages+=("$package")
-  done
-
-  [[ "${#packages[@]}" -eq 0 ]] && return
-
-  echo "Installing base packages: ${packages[*]}..."
-  install_packages "${packages[@]}"
-  if command -v update-ca-certificates >/dev/null 2>&1; then
-    update-ca-certificates >/dev/null 2>&1 || true
-  fi
-}
-
-ensure_nginx() {
-  if ! command -v nginx >/dev/null 2>&1; then
-    echo "nginx not found, installing..."
-    install_packages nginx
-  fi
-}
-
-ensure_jq() {
-  if command -v jq >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "jq not found, installing..."
-  install_packages jq
-}
-
-ensure_curl() {
-  if command -v curl >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "curl not found, installing..."
-  install_packages curl
-}
-
-nginx_has_builtin_stream() {
-  nginx -V 2>&1 | grep -q -- '--with-stream' &&
-    ! nginx -V 2>&1 | grep -q -- '--with-stream=dynamic'
-}
-
-find_nginx_stream_module() {
-  local module
-  for module in \
-    /usr/lib/nginx/modules/ngx_stream_module.so \
-    /usr/lib64/nginx/modules/ngx_stream_module.so \
-    /usr/share/nginx/modules/ngx_stream_module.so \
-    /etc/nginx/modules/ngx_stream_module.so; do
-    if [[ -f "$module" ]]; then
-      printf '%s' "$module"
-      return 0
-    fi
-  done
-
-  find /usr /etc -path '*/nginx/modules/ngx_stream_module.so' -print -quit 2>/dev/null
-}
-
-write_nginx_stream_module_loads() {
-  local module_path module_conf
-
-  if nginx_has_builtin_stream; then
-    return 0
-  fi
-
-  module_path="$(find_nginx_stream_module)"
-  if [[ -n "$module_path" ]]; then
-    echo "load_module $module_path;"
-    return 0
-  fi
-
-  for module_conf in \
-    /etc/nginx/modules-enabled/*stream*.conf \
-    /usr/share/nginx/modules-enabled/*stream*.conf \
-    /usr/share/nginx/modules-available/*stream*.conf \
-    /etc/nginx/modules-available/*stream*.conf \
-    /usr/share/nginx/modules/*stream*.conf; do
-    [[ -f "$module_conf" ]] || continue
-    if grep -Eq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$module_conf"; then
-      grep -E '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$module_conf"
-      return 0
-    fi
-  done
-}
-
-dedupe_nginx_stream_module_links() {
-  local enabled_dir="/etc/nginx/modules-enabled"
-  local keep="" conf
-
-  [[ -d "$enabled_dir" ]] || return 0
-
-  for conf in "$enabled_dir"/*stream*.conf; do
-    [[ -e "$conf" ]] || continue
-    if grep -Eq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$conf" 2>/dev/null; then
-      if [[ -z "$keep" ]]; then
-        keep="$conf"
-      elif [[ -L "$conf" ]]; then
-        rm -f "$conf"
-      fi
-    fi
-  done
-
-  return 0
-}
-
-nginx_stream_module_declared() {
-  local nginx_conf="/etc/nginx/nginx.conf"
-
-  if grep -Eq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$nginx_conf"; then
-    return 0
-  fi
-
-  if grep -Eq '^[[:space:]]*include[[:space:]]+(/etc/nginx/)?modules-enabled/\*\.conf;' "$nginx_conf" &&
-    grep -REq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' /etc/nginx/modules-enabled 2>/dev/null; then
-    return 0
-  fi
-
-  if grep -Eq '^[[:space:]]*include[[:space:]]+/usr/share/nginx/modules/\*\.conf;' "$nginx_conf" &&
-    grep -REq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' /usr/share/nginx/modules 2>/dev/null; then
-    return 0
-  fi
-
-  return 1
-}
-
-enable_nginx_stream_module() {
-  local nginx_conf="/etc/nginx/nginx.conf"
-  local module_path module_conf
-
-  [[ -f "$nginx_conf" ]] || die "nginx config not found: $nginx_conf"
-
-  dedupe_nginx_stream_module_links
-
-  if [[ -d /etc/nginx/modules-enabled ]]; then
-    if ! grep -REq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' /etc/nginx/modules-enabled 2>/dev/null; then
-      for module_conf in /usr/share/nginx/modules-available/*stream*.conf /etc/nginx/modules-available/*stream*.conf; do
-        if [[ -f "$module_conf" ]]; then
-          ln -sf "$module_conf" "/etc/nginx/modules-enabled/50-$(basename "$module_conf")"
-          break
-        fi
-      done
-    fi
-  fi
-
-  if nginx_stream_module_declared; then
-    return 0
-  fi
-
-  module_path="$(find_nginx_stream_module)"
-  [[ -n "$module_path" ]] || return 0
-
-  cp "$nginx_conf" "$nginx_conf.bak.$(date +%Y%m%d%H%M%S)"
-  {
-    echo "load_module $module_path;"
-    cat "$nginx_conf"
-  } > "$nginx_conf.tmp.$$"
-  mv "$nginx_conf.tmp.$$" "$nginx_conf"
-}
-
-nginx_test() {
-  local output
-  if output="$(nginx -t 2>&1)"; then
-    return 0
-  fi
-  echo "$output" >&2
-  return 1
-}
-
-nginx_test_reports_unknown_stream() {
-  nginx -t 2>&1 | grep -q 'unknown directive "stream"'
-}
-
-nginx_supports_stream_context() {
-  local tmp_conf output
-  tmp_conf="$(mktemp)"
-  {
-    write_nginx_stream_module_loads
-    cat <<'EOF'
-events {
-    worker_connections 16;
-}
-stream {
-    server {
-        listen 127.0.0.1:65535;
-        proxy_pass 127.0.0.1:1;
-    }
-}
-EOF
-  } > "$tmp_conf"
-  if output="$(nginx -t -c "$tmp_conf" 2>&1)"; then
-    rm -f "$tmp_conf"
-    return 0
-  fi
-  rm -f "$tmp_conf"
-  [[ "$output" == *'unknown directive "stream"'* ]] && return 1
-  return 1
-}
-
-disable_generated_stream_include_for_repair() {
-  local nginx_conf="/etc/nginx/nginx.conf"
-
-  [[ -f "$nginx_conf" ]] || return 0
-  if ! grep -q 'include /etc/nginx/stream.d/\*.conf;' "$nginx_conf"; then
-    return 0
-  fi
-
-  cp "$nginx_conf" "$nginx_conf.bak.disable-stream.$(date +%Y%m%d%H%M%S)"
-  awk '
-    /^[[:space:]]*stream[[:space:]]*\{[[:space:]]*$/ {
-      buffer = $0 ORS
-      depth = 1
-      in_stream = 1
-      has_include = 0
-      next
-    }
-    in_stream {
-      buffer = buffer $0 ORS
-      if ($0 ~ /include[[:space:]]+\/etc\/nginx\/stream\.d\/\*\.conf;/) {
-        has_include = 1
-      }
-      depth += gsub(/\{/, "{")
-      depth -= gsub(/\}/, "}")
-      if (depth <= 0) {
-        if (!has_include) {
-          printf "%s", buffer
-        }
-        buffer = ""
-        in_stream = 0
-      }
-      next
-    }
-    { print }
-    END {
-      if (in_stream && !has_include) {
-        printf "%s", buffer
-      }
-    }
-  ' "$nginx_conf" > "$nginx_conf.tmp.$$"
-  mv "$nginx_conf.tmp.$$" "$nginx_conf"
-  return 0
-}
-
-ensure_nginx_stream_module() {
-  echo "Ensuring nginx stream module..."
-
-  if nginx_supports_stream_context; then
-    echo "nginx stream context is already supported."
-    return 0
-  fi
-
-  if nginx_test_reports_unknown_stream; then
-    echo "Repairing nginx.conf before loading stream module..."
-    disable_generated_stream_include_for_repair
-  fi
-
-  enable_nginx_stream_module
-  if nginx_supports_stream_context; then
-    echo "nginx stream module is already loadable."
-    return 0
-  fi
-
-  echo "nginx stream module not detected, installing..."
-  if command -v apt-get >/dev/null 2>&1; then
-    install_packages libnginx-mod-stream
-  elif command -v yum >/dev/null 2>&1; then
-    install_packages nginx-mod-stream
-  elif command -v dnf >/dev/null 2>&1; then
-    install_packages nginx-mod-stream
-  elif command -v apk >/dev/null 2>&1; then
-    install_packages nginx-mod-stream
-  else
-    die "nginx stream module is required, but no supported package manager was found"
-  fi
-
-  enable_nginx_stream_module
-  if ! nginx_supports_stream_context; then
-    nginx -V 2>&1 >&2 || true
-    die "nginx stream module is installed but stream context is still not supported"
-  fi
-  echo "nginx stream module installed and loadable."
-}
-
-validate_sni() {
-  local value="$1"
-  [[ -n "$value" ]] || die "SNI is empty"
-  [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid SNI: $value"
-  printf '%s' "$value"
-}
-
-validate_port() {
-  local value="$1"
-  [[ "$value" =~ ^[0-9]+$ ]] || die "port must be a number: $value"
-  (( value >= 1 && value <= 65535 )) || die "port out of range: $value"
-  printf '%s' "$value"
-}
-
-normalize_api_host() {
-  local value="$1"
-  value="${value%/}"
-  [[ -n "$value" ]] || die "ApiHost is empty"
-  case "$value" in
-    http://*|https://*) ;;
-    *) die "ApiHost must start with http:// or https://: $value" ;;
-  esac
-  printf '%s' "$value"
-}
-
-validate_node_id() {
-  local value="$1"
-  [[ "$value" =~ ^[0-9]+$ ]] || die "NodeID must be a number: $value"
-  printf '%s' "$value"
+  ensure_command curl curl
+  ensure_command wget wget
+  ensure_command jq jq
 }
 
 debug_enabled() {
   [[ "$DEBUG" == "1" || "$DEBUG" == "true" || "$DEBUG" == "yes" ]]
 }
 
-panel_config_is_usable() {
-  local file="$1"
-  jq -e '
-    type == "object" and
-    (
-      [
-        .. | objects
-        | select(
-            has("protocol") or
-            has("server_port") or
-            has("service_port") or
-            has("tls_settings") or
-            has("network_settings") or
-            has("base_config") or
-            has("server_name") or
-            has("serverName") or
-            has("server_names") or
-            has("serverNames") or
-            has("reality_settings") or
-            has("realitySettings")
-          )
-      ] | length > 0
-    )
-  ' "$file" >/dev/null 2>&1
-}
-
-debug_panel_response() {
+debug_file_summary() {
   local label="$1"
   local file="$2"
-
   debug_enabled || return 0
   jq -r --arg label "$label" '
-    def one_line:
-      tostring | gsub("[\r\n\t]+"; " ") | .[0:160];
+    def one_line: tostring | gsub("[\r\n\t]+"; " ") | .[0:180];
     "Debug: tried \($label)",
-    "Debug: top-level keys: \((keys_unsorted // []) | join(","))",
-    (if has("status") then "Debug: status: \(.status | one_line)" else empty end),
-    (if has("message") then "Debug: message: \(.message | one_line)" else empty end),
-    (if has("msg") then "Debug: msg: \(.msg | one_line)" else empty end),
-    (if has("error") then "Debug: error: \(.error | one_line)" else empty end)
+    "Debug: keys: \((keys_unsorted // []) | join(","))",
+    (if has("status") then "Debug: status=\(.status | one_line)" else empty end),
+    (if has("message") then "Debug: message=\(.message | one_line)" else empty end),
+    (if has("msg") then "Debug: msg=\(.msg | one_line)" else empty end),
+    (if has("error") then "Debug: error=\(.error | one_line)" else empty end)
   ' "$file" >&2 2>/dev/null || true
-}
-
-debug_panel_request_error() {
-  local label="$1"
-  local api_key="$2"
-  local file="$3"
-  local message
-
-  debug_enabled || return 0
-  message="$(tr '\n' ' ' < "$file" 2>/dev/null | cut -c 1-240 || true)"
-  message="${message//$api_key/***}"
-  [[ -n "$message" ]] || message="request failed before receiving a JSON response"
-  echo "Debug: request failed $label" >&2
-  echo "Debug: curl error: $message" >&2
 }
 
 remember_panel_error() {
   local label="$1"
   local file="$2"
   local summary
-
   summary="$(jq -r --arg label "$label" '
-    def one_line:
-      tostring | gsub("[\r\n\t]+"; " ") | .[0:180];
+    def one_line: tostring | gsub("[\r\n\t]+"; " ") | .[0:180];
     [
       "endpoint=\($label)",
       (if has("status") then "status=\(.status | one_line)" else empty end),
@@ -514,8 +166,21 @@ remember_panel_error() {
       (if has("error") then "error=\(.error | one_line)" else empty end)
     ] | join(" ")
   ' "$file" 2>/dev/null || true)"
-
   [[ -n "$summary" ]] && LAST_PANEL_ERROR="$summary"
+}
+
+panel_config_is_usable() {
+  local file="$1"
+  jq -e '
+    type == "object" and
+    ([ .. | objects | select(
+      has("serverName") or has("server_name") or has("sni") or
+      has("reality_settings") or has("realitySettings") or
+      has("service_port") or has("local_port") or has("listen_port") or
+      has("server_port") or has("port") or has("tls_settings") or
+      has("network_settings")
+    ) ] | length > 0)
+  ' "$file" >/dev/null 2>&1
 }
 
 try_panel_config_request() {
@@ -524,10 +189,8 @@ try_panel_config_request() {
   local api_key="$3"
   local output="$4"
   local path="$5"
-  local node_type="$6"
-  local token_param="$7"
-  local auth_mode="$8"
-  local label="$9"
+  local token_name="$6"
+  local label="$7"
   local url="${api_host}${path}"
   local curl_error
   local curl_args=(
@@ -537,36 +200,20 @@ try_panel_config_request() {
     --get
     -A "v2node go-resty (https://github.com/go-resty/resty)"
     -H "Accept: application/json"
+    --data-urlencode "node_id=$node_id"
+    --data-urlencode "node_type=v2node"
   )
 
-  curl_args+=(--data-urlencode "node_id=$node_id")
-  [[ -n "$node_type" ]] && curl_args+=(--data-urlencode "node_type=$node_type")
-
-  case "$token_param" in
-    token) curl_args+=(--data-urlencode "token=$api_key") ;;
-    key) curl_args+=(--data-urlencode "key=$api_key") ;;
-    api_key) curl_args+=(--data-urlencode "api_key=$api_key") ;;
+  case "$token_name" in
+    token|key|api_key) curl_args+=(--data-urlencode "$token_name=$api_key") ;;
     none) ;;
   esac
-
-  case "$auth_mode" in
-    plain) curl_args+=(-H "Authorization: $api_key") ;;
-    bearer) curl_args+=(-H "Authorization: Bearer $api_key") ;;
-    x-api-key) curl_args+=(-H "X-Api-Key: $api_key") ;;
-    token-header) curl_args+=(-H "Token: $api_key") ;;
-    none) ;;
-  esac
-
-  curl_args+=(
-    -H "X-Node-ID: $node_id"
-    -H "X-Node-Type: ${node_type:-v2node}"
-  )
 
   curl_error="$(mktemp)"
   if curl "${curl_args[@]}" "$url" -o "$output" 2>"$curl_error"; then
     rm -f "$curl_error"
     if jq empty "$output" >/dev/null 2>&1; then
-      debug_panel_response "$label" "$output"
+      debug_file_summary "$label" "$output"
       if panel_config_is_usable "$output"; then
         echo "Fetched node config: $label" >&2
         return 0
@@ -574,9 +221,11 @@ try_panel_config_request() {
       remember_panel_error "$label" "$output"
     fi
   else
-    debug_panel_request_error "$label" "$api_key" "$curl_error"
+    if debug_enabled; then
+      echo "Debug: request failed $label" >&2
+      sed 's/[[:cntrl:]]//g' "$curl_error" | cut -c 1-240 >&2 || true
+    fi
   fi
-
   rm -f "$curl_error"
   return 1
 }
@@ -586,43 +235,24 @@ fetch_panel_config() {
   local node_id="$2"
   local api_key="$3"
   local output="$4"
-  local path
 
-  # Match upstream v2node exactly: it calls /api/v2/server/config with these
-  # query params, not node_type=vless headers.
-  if try_panel_config_request \
-    "$api_host" "$node_id" "$api_key" "$output" \
-    "/api/v2/server/config" "v2node" "token" "none" \
+  if try_panel_config_request "$api_host" "$node_id" "$api_key" "$output" \
+    "/api/v2/server/config" "token" \
     "/api/v2/server/config?node_type=v2node&node_id=$node_id&token=***"; then
     return 0
   fi
 
-  for path in \
-    "/api/v2/server/config" \
-    "/api/v1/server/UniProxy/config" \
-    "/api/v1/server/VLess/config" \
-    "/api/v1/server/vless/config"; do
-    for request in \
-      "v2node key none" \
-      "v2node api_key none" \
-      "vless token none" \
-      "vless key none" \
-      "v2node none plain" \
-      "v2node none bearer" \
-      "v2node none x-api-key" \
-      "v2node none token-header" \
-      "vless none plain" \
-      "vless none bearer" \
-      "vless none x-api-key"; do
-      read -r node_type token_param auth_mode <<< "$request"
-      if try_panel_config_request \
-        "$api_host" "$node_id" "$api_key" "$output" \
-        "$path" "$node_type" "$token_param" "$auth_mode" \
-        "$path?node_type=$node_type&node_id=$node_id&${token_param}=*** auth=$auth_mode"; then
-        return 0
-      fi
-    done
-  done
+  if try_panel_config_request "$api_host" "$node_id" "$api_key" "$output" \
+    "/api/v2/server/config" "key" \
+    "/api/v2/server/config?node_type=v2node&node_id=$node_id&key=***"; then
+    return 0
+  fi
+
+  if try_panel_config_request "$api_host" "$node_id" "$api_key" "$output" \
+    "/api/v2/server/config" "api_key" \
+    "/api/v2/server/config?node_type=v2node&node_id=$node_id&api_key=***"; then
+    return 0
+  fi
 
   return 1
 }
@@ -632,29 +262,20 @@ extract_config_sni() {
   jq -r '
     def walk(f):
       . as $in
-      | if type == "object" then
-          reduce keys[] as $key ({}; . + {($key): ($in[$key] | walk(f))}) | f
-        elif type == "array" then
-          map(walk(f)) | f
-        else
-          f
-        end;
+      | if type == "object" then reduce keys[] as $key ({}; . + {($key): ($in[$key] | walk(f))}) | f
+        elif type == "array" then map(walk(f)) | f
+        else f end;
     def parse_json_strings:
       walk(if type == "string" then (. as $value | try fromjson catch $value) else . end);
     def clean_sni:
-      tostring
-      | split(",")[0]
-      | split(":")[0]
-      | gsub("^\\s+|\\s+$"; "");
+      tostring | split(",")[0] | split(":")[0] | gsub("^\\s+|\\s+$"; "");
     parse_json_strings as $root
-    |
-    [
-      $root | .. | objects
-      | .serverName? // .server_name? // .server_name_sni? // .sni? // .SNI?
-        // .dest? // .Dest? // .target? // .Target?
-        // .reality_server_name? // .realityServerName?
-        // .serverNames?[]? // .server_names?[]? // .server_names?
-    ]
+    | [
+        $root | .. | objects
+        | .serverName? // .server_name? // .server_name_sni? // .sni? // .SNI?
+          // .reality_server_name? // .realityServerName?
+          // .serverNames?[]? // .server_names?[]? // .server_names?
+      ]
     | map(select((type == "string" or type == "number") and (tostring | length > 0)))
     | map(clean_sni)
     | map(select(test("^[A-Za-z0-9._-]+$")))
@@ -665,17 +286,13 @@ extract_config_sni() {
 
 extract_config_port() {
   local file="$1"
-  local listen_port="${2:-443}"
-  jq -r --arg listen_port "$listen_port" '
+  local public_port="$2"
+  jq -r --arg public_port "$public_port" '
     def walk(f):
       . as $in
-      | if type == "object" then
-          reduce keys[] as $key ({}; . + {($key): ($in[$key] | walk(f))}) | f
-        elif type == "array" then
-          map(walk(f)) | f
-        else
-          f
-        end;
+      | if type == "object" then reduce keys[] as $key ({}; . + {($key): ($in[$key] | walk(f))}) | f
+        elif type == "array" then map(walk(f)) | f
+        else f end;
     def parse_json_strings:
       walk(if type == "string" then (. as $value | try fromjson catch $value) else . end);
     def port_value:
@@ -683,83 +300,29 @@ extract_config_port() {
       elif type == "string" then (capture("(?<port>[0-9]{1,5})").port? // empty)
       else empty end;
     def valid_port:
-      select(length > 0)
-      | select((tonumber >= 1) and (tonumber <= 65535));
+      select(length > 0) | select((tonumber >= 1) and (tonumber <= 65535));
     parse_json_strings as $root
-    |
-    (
-      [
-        $root | .. | objects
-        | .service_port? // .local_port? // .listen_port? // .ServicePort? // .LocalPort? // .ListenPort?
-      ]
-      | map(port_value | valid_port)
-      | map(select(. != $listen_port))
-      | first
-    ) //
-    (
-      [
-        $root | .. | objects
-        | .servicePort? // .backend_port? // .backendPort? // .BackendPort? // .target_port? // .targetPort?
-      ]
-      | map(port_value | valid_port)
-      | map(select(. != $listen_port))
-      | first
-    ) //
-    (
-      [
-        $root | .. | objects
-        | .service_port? // .local_port? // .listen_port? // .ServicePort? // .LocalPort? // .ListenPort?
-          // .servicePort? // .backend_port? // .backendPort? // .BackendPort? // .target_port? // .targetPort?
-          // .server_port? // .port? // .ServerPort? // .Port? // .serverPort?
-      ]
-      | map(port_value | valid_port)
-      | map(select(. != $listen_port))
-      | first
-    ) //
-    (
-      [
-        $root | .. | objects
-        | .service_port? // .local_port? // .listen_port? // .ServicePort? // .LocalPort? // .ListenPort?
-          // .servicePort? // .backend_port? // .backendPort? // .BackendPort? // .target_port? // .targetPort?
-          // .server_port? // .port? // .ServerPort? // .Port? // .serverPort?
-      ]
-      | map(port_value | valid_port)
-      | first
-    ) //
-    empty
-  ' "$file"
-}
-
-extract_config_public_port_candidates() {
-  local file="$1"
-  jq -r '
-    def walk(f):
-      . as $in
-      | if type == "object" then
-          reduce keys[] as $key ({}; . + {($key): ($in[$key] | walk(f))}) | f
-        elif type == "array" then
-          map(walk(f)) | f
-        else
-          f
-        end;
-    def parse_json_strings:
-      walk(if type == "string" then (. as $value | try fromjson catch $value) else . end);
-    def port_value:
-      if type == "number" then tostring
-      elif type == "string" then (capture("(?<port>[0-9]{1,5})").port? // empty)
-      else empty end;
-    def valid_port:
-      select(length > 0)
-      | select((tonumber >= 1) and (tonumber <= 65535));
-    parse_json_strings as $root
-    |
-    [
-      $root | .. | objects
-      | .server_port? // .port? // .ServerPort? // .Port? // .serverPort?
-    ]
-    | map(port_value | valid_port)
-    | unique
-    | join(",")
+    | (
+        [
+          $root | .. | objects
+          | .service_port? // .servicePort? // .local_port? // .localPort?
+            // .listen_port? // .listenPort? // .backend_port? // .backendPort?
+            // .target_port? // .targetPort?
+        ]
+        | map(port_value | valid_port)
+        | map(select(. != $public_port))
+        | first
+      ) //
+      (
+        [
+          $root | .. | objects
+          | .server_port? // .serverPort? // .port? // .Port?
+        ]
+        | map(port_value | valid_port)
+        | map(select(. != $public_port))
+        | first
+      ) //
+      empty
   ' "$file"
 }
 
@@ -767,34 +330,28 @@ discover_node_route() {
   local api_host="$1"
   local node_id="$2"
   local api_key="$3"
-  local config_file sni local_port public_port_candidates
+  local config_file sni local_port
   config_file="$(mktemp)"
 
   if ! fetch_panel_config "$api_host" "$node_id" "$api_key" "$config_file"; then
     rm -f "$config_file"
     if [[ -n "$LAST_PANEL_ERROR" ]]; then
-      die "cannot read node config from $api_host node $node_id; last panel response: $LAST_PANEL_ERROR. Check ApiHost, NodeID and ApiKey, or use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
+      die "cannot read node config from $api_host node $node_id; last panel response: $LAST_PANEL_ERROR"
     fi
     die "cannot read node config from $api_host node $node_id; use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
   fi
 
   sni="$(extract_config_sni "$config_file")"
   local_port="$(extract_config_port "$config_file" "$LISTEN_PORT")"
-  public_port_candidates="$(extract_config_public_port_candidates "$config_file")"
   rm -f "$config_file"
 
-  [[ -n "$sni" ]] ||
-    die "cannot auto-detect Reality SNI for $api_host node $node_id; use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
-  [[ -n "$local_port" ]] ||
-    die "cannot auto-detect service port for $api_host node $node_id; use manual form SNI,LOCAL_PORT,API_HOST,NODE_ID,API_KEY"
+  [[ -n "$sni" ]] || die "cannot auto-detect Reality SNI for $api_host node $node_id"
+  [[ -n "$local_port" ]] || die "cannot auto-detect backend service port for $api_host node $node_id"
 
   sni="$(validate_sni "$sni")"
   local_port="$(validate_port "$local_port")"
-  if [[ "$local_port" != "$LISTEN_PORT" && ",$public_port_candidates," == *",$LISTEN_PORT,"* ]]; then
-    echo "Detected public/connect port $LISTEN_PORT and backend service port $local_port for $sni" >&2
-  fi
-  NODES+=("$sni"$'\t'"$local_port"$'\t'"$api_host"$'\t'"$node_id"$'\t'"$api_key")
   echo "Auto-detected route: $sni -> 127.0.0.1:$local_port ($api_host node $node_id)"
+  NODES+=("$sni"$'\t'"$local_port"$'\t'"$api_host"$'\t'"$node_id"$'\t'"$api_key")
 }
 
 remember_first_node() {
@@ -818,7 +375,6 @@ parse_node_csv() {
     api_host="$(normalize_api_host "$api_host")"
     node_id="$(validate_node_id "$node_id")"
     [[ -n "$api_key" ]] || die "ApiKey is empty for $api_host node $node_id"
-
     AUTO_NODES+=("$api_host"$'\t'"$node_id"$'\t'"$api_key")
     ATTACH_ARGS+=("--node" "$api_host,$node_id,$api_key")
     remember_first_node "$api_host" "$node_id" "$api_key"
@@ -832,7 +388,6 @@ parse_node_csv() {
     api_host="$(normalize_api_host "$api_host")"
     node_id="$(validate_node_id "$node_id")"
     [[ -n "$api_key" ]] || die "ApiKey is empty for $api_host node $node_id"
-
     NODES+=("$sni"$'\t'"$local_port"$'\t'"$api_host"$'\t'"$node_id"$'\t'"$api_key")
     ATTACH_ARGS+=("--node" "$api_host,$node_id,$api_key")
     remember_first_node "$api_host" "$node_id" "$api_key"
@@ -843,21 +398,20 @@ parse_node_csv() {
 }
 
 validate_routes() {
-  local item sni local_port api_host node_id api_key seen_snis="" seen_ports=""
+  local item sni local_port api_host node_id api_key
+  local seen_snis="" seen_ports=""
+
   for item in "${NODES[@]}"; do
     IFS=$'\t' read -r sni local_port api_host node_id api_key <<< "$item"
-
     if [[ "$local_port" == "$LISTEN_PORT" ]]; then
-      die_local_port_conflicts_with_public_port "$sni" "$local_port"
+      die "backend service port for $sni is $local_port, same as public listen port $LISTEN_PORT. Change panel service/listen port to a non-$LISTEN_PORT port."
     fi
-
     case $'\n'"$seen_snis"$'\n' in
       *$'\n'"$sni"$'\n'*) die "duplicate SNI: $sni" ;;
     esac
     case $'\n'"$seen_ports"$'\n' in
-      *$'\n'"$local_port"$'\n'*) die "duplicate LOCAL_PORT: $local_port" ;;
+      *$'\n'"$local_port"$'\n'*) die "duplicate backend service port: $local_port" ;;
     esac
-
     seen_snis+="${sni}"$'\n'
     seen_ports+="${local_port}"$'\n'
   done
@@ -872,47 +426,37 @@ discover_auto_nodes() {
 }
 
 install_v2node_if_requested() {
-  if [[ "$INSTALL_V2NODE" -ne 1 ]]; then
+  local tmp_dir="$1"
+  local install_script
+  [[ "$INSTALL_V2NODE" -eq 1 ]] || {
     echo "Skipping official v2node install/update; --install-v2node was not provided."
     return 0
-  fi
+  }
   [[ -n "$FIRST_API_HOST" && -n "$FIRST_NODE_ID" && -n "$FIRST_API_KEY" ]] ||
     die "cannot determine first node for non-interactive upstream install"
 
-  local install_script="$1/install.sh"
+  install_script="$tmp_dir/install.sh"
   echo "Downloading official v2node installer..."
   download "$INSTALL_URL" "$install_script"
   chmod +x "$install_script"
 
-  local install_args=()
-  if [[ -n "$INSTALL_VERSION" ]]; then
-    install_args+=("$INSTALL_VERSION")
-  fi
-  install_args+=(
-    --api-host "$FIRST_API_HOST"
-    --node-id "$FIRST_NODE_ID"
-    --api-key "$FIRST_API_KEY"
-  )
+  local args=()
+  [[ -n "$INSTALL_VERSION" ]] && args+=("$INSTALL_VERSION")
+  args+=(--api-host "$FIRST_API_HOST" --node-id "$FIRST_NODE_ID" --api-key "$FIRST_API_KEY")
 
   echo "Installing/updating official v2node..."
-  bash "$install_script" "${install_args[@]}"
+  bash "$install_script" "${args[@]}"
 }
 
 run_attach_helper() {
   local tmp_dir="$1"
   local attach_script="$tmp_dir/v2node-node-attach.sh"
-  local local_attach
-  local_attach="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/v2node-node-attach.sh"
 
-  if [[ -x "$local_attach" ]]; then
-    attach_script="$local_attach"
-  else
-    echo "Downloading v2node node attach helper..."
-    download "$ATTACH_URL" "$attach_script"
-    chmod +x "$attach_script"
-  fi
+  echo "Downloading v2node node attach helper..."
+  download "$ATTACH_URL" "$attach_script"
+  chmod +x "$attach_script"
 
-  echo "Updating /etc/v2node/config.json..."
+  echo "Updating $CONFIG..."
   if [[ "$RESTART_V2NODE" -eq 1 ]]; then
     bash "$attach_script" "${ATTACH_ARGS[@]}" --restart
   else
@@ -920,26 +464,138 @@ run_attach_helper() {
   fi
 }
 
-ensure_nginx_stream_include() {
+ensure_nginx() {
+  if command -v nginx >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "nginx not found, installing..."
+  install_packages nginx
+}
+
+nginx_has_builtin_stream() {
+  nginx -V 2>&1 | grep -q -- '--with-stream' &&
+    ! nginx -V 2>&1 | grep -q -- '--with-stream=dynamic'
+}
+
+find_nginx_stream_module() {
+  local module
+  for module in \
+    /usr/lib/nginx/modules/ngx_stream_module.so \
+    /usr/lib64/nginx/modules/ngx_stream_module.so \
+    /usr/share/nginx/modules/ngx_stream_module.so \
+    /etc/nginx/modules/ngx_stream_module.so; do
+    [[ -f "$module" ]] && { printf '%s' "$module"; return 0; }
+  done
+  find /usr /etc -path '*/nginx/modules/ngx_stream_module.so' -print -quit 2>/dev/null || true
+}
+
+nginx_loads_stream_module() {
   local nginx_conf="/etc/nginx/nginx.conf"
-  local stream_dir="/etc/nginx/stream.d"
+  nginx_has_builtin_stream && return 0
+  grep -Eq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' "$nginx_conf" 2>/dev/null && return 0
+  if grep -Eq '^[[:space:]]*include[[:space:]]+(/etc/nginx/)?modules-enabled/\*\.conf;' "$nginx_conf" 2>/dev/null &&
+    grep -REq '^[[:space:]]*load_module[[:space:]]+.*ngx_stream_module\.so' /etc/nginx/modules-enabled 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
 
-  echo "Ensuring nginx stream include..."
-  mkdir -p "$stream_dir"
-
-  [[ -f "$nginx_conf" ]] || die "nginx config not found: $nginx_conf"
-
-  if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$nginx_conf"; then
-    if ! grep -q '/etc/nginx/stream.d/\*.conf' "$nginx_conf"; then
-      echo "Error: nginx.conf already has a stream block but does not include /etc/nginx/stream.d/*.conf" >&2
-      echo "Please add this line inside the existing stream block:" >&2
-      echo "    include /etc/nginx/stream.d/*.conf;" >&2
-      exit 1
-    fi
+remove_own_stream_block_if_stream_unknown() {
+  local nginx_conf="/etc/nginx/nginx.conf"
+  if nginx -t >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! nginx -t 2>&1 | grep -q 'unknown directive "stream"'; then
+    return 0
+  fi
+  if ! grep -q 'include /etc/nginx/stream.d/\*.conf;' "$nginx_conf" 2>/dev/null; then
     return 0
   fi
 
-  cp "$nginx_conf" "$nginx_conf.bak.$(date +%Y%m%d%H%M%S)"
+  echo "Repairing old generated stream block before loading stream module..."
+  cp "$nginx_conf" "$nginx_conf.bak.remove-generated-stream.$(date +%Y%m%d%H%M%S)"
+  awk '
+    /^[[:space:]]*stream[[:space:]]*\{[[:space:]]*$/ {
+      buffer = $0 ORS
+      depth = 1
+      in_stream = 1
+      has_mux_include = 0
+      next
+    }
+    in_stream {
+      buffer = buffer $0 ORS
+      if ($0 ~ /include[[:space:]]+\/etc\/nginx\/stream\.d\/\*\.conf;/) {
+        has_mux_include = 1
+      }
+      depth += gsub(/\{/, "{")
+      depth -= gsub(/\}/, "}")
+      if (depth <= 0) {
+        if (!has_mux_include) {
+          printf "%s", buffer
+        }
+        buffer = ""
+        in_stream = 0
+      }
+      next
+    }
+    { print }
+  ' "$nginx_conf" > "$nginx_conf.tmp.$$"
+  mv "$nginx_conf.tmp.$$" "$nginx_conf"
+}
+
+install_nginx_stream_package() {
+  echo "Installing nginx stream module package..."
+  if command -v apt-get >/dev/null 2>&1; then
+    install_packages libnginx-mod-stream
+  elif command -v yum >/dev/null 2>&1; then
+    install_packages nginx-mod-stream
+  elif command -v dnf >/dev/null 2>&1; then
+    install_packages nginx-mod-stream
+  elif command -v apk >/dev/null 2>&1; then
+    install_packages nginx-mod-stream
+  elif command -v pacman >/dev/null 2>&1; then
+    install_packages nginx-mainline
+  else
+    die "cannot install nginx stream module: unsupported package manager"
+  fi
+}
+
+enable_nginx_stream_module() {
+  local nginx_conf="/etc/nginx/nginx.conf"
+  local module_path
+
+  remove_own_stream_block_if_stream_unknown
+  nginx_loads_stream_module && return 0
+
+  install_nginx_stream_package
+  nginx_loads_stream_module && return 0
+
+  module_path="$(find_nginx_stream_module)"
+  [[ -n "$module_path" ]] || die "ngx_stream_module.so not found after installing stream module package"
+
+  echo "Adding load_module $module_path to $nginx_conf"
+  cp "$nginx_conf" "$nginx_conf.bak.load-stream.$(date +%Y%m%d%H%M%S)"
+  {
+    echo "load_module $module_path;"
+    cat "$nginx_conf"
+  } > "$nginx_conf.tmp.$$"
+  mv "$nginx_conf.tmp.$$" "$nginx_conf"
+}
+
+ensure_nginx_stream_include() {
+  local nginx_conf="/etc/nginx/nginx.conf"
+  mkdir -p /etc/nginx/stream.d
+
+  if grep -q 'include /etc/nginx/stream.d/\*.conf;' "$nginx_conf" 2>/dev/null; then
+    return 0
+  fi
+
+  if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$nginx_conf"; then
+    die "nginx.conf already has a stream block. Add this inside it: include /etc/nginx/stream.d/*.conf;"
+  fi
+
+  echo "Adding stream include to $nginx_conf"
+  cp "$nginx_conf" "$nginx_conf.bak.stream-include.$(date +%Y%m%d%H%M%S)"
   cat >> "$nginx_conf" <<'EOF'
 
 stream {
@@ -953,12 +609,12 @@ write_nginx_mux_config() {
   local first_backend=""
   local item sni local_port api_host node_id api_key
 
-  echo "Writing nginx mux config..."
   for item in "${NODES[@]}"; do
     IFS=$'\t' read -r sni local_port api_host node_id api_key <<< "$item"
     first_backend="${first_backend:-127.0.0.1:$local_port}"
   done
 
+  echo "Writing $conf"
   {
     echo "# Generated by v2node-443-mux.sh. Do not edit manually."
     echo "map \$ssl_preread_server_name \$v2node_mux_backend {"
@@ -975,13 +631,12 @@ write_nginx_mux_config() {
     echo "    ssl_preread on;"
     echo "}"
   } > "$conf"
-
-  echo "Wrote $conf"
 }
 
 reload_nginx() {
-  echo "Reloading nginx..."
+  echo "Testing nginx config..."
   nginx -t
+  echo "Reloading nginx..."
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx
@@ -1003,34 +658,6 @@ listening_on_port() {
   fi
 }
 
-print_runtime_checks() {
-  local item sni local_port api_host node_id api_key failed=0
-
-  echo
-  echo "Runtime checks:"
-  if listening_on_port "$LISTEN_PORT"; then
-    echo "  OK public :$LISTEN_PORT is listening"
-  else
-    echo "  WARN public :$LISTEN_PORT is not listening; check nginx -t and systemctl status nginx"
-    failed=1
-  fi
-
-  for item in "${NODES[@]}"; do
-    IFS=$'\t' read -r sni local_port api_host node_id api_key <<< "$item"
-    if listening_on_port "$local_port"; then
-      echo "  OK backend 127.0.0.1:$local_port is listening for $sni"
-    else
-      echo "  WARN backend 127.0.0.1:$local_port is not listening for $sni; check v2node logs and panel service port"
-      failed=1
-    fi
-  done
-
-  if [[ "$failed" -eq 1 ]]; then
-    echo
-    echo "A process can be running while the route is still broken. The warnings above show which port is missing."
-  fi
-}
-
 print_summary() {
   local item sni local_port api_host node_id api_key
   echo
@@ -1042,9 +669,20 @@ print_summary() {
     echo "  - $sni -> 127.0.0.1:$local_port ($api_host node $node_id)"
   done
   echo
-  echo "Panel requirement: each backend node service port must match its LOCAL_PORT,"
-  echo "while the client/connect port can stay $LISTEN_PORT."
-  print_runtime_checks
+  echo "Runtime checks:"
+  if listening_on_port "$LISTEN_PORT"; then
+    echo "  OK public :$LISTEN_PORT is listening"
+  else
+    echo "  WARN public :$LISTEN_PORT is not listening"
+  fi
+  for item in "${NODES[@]}"; do
+    IFS=$'\t' read -r sni local_port api_host node_id api_key <<< "$item"
+    if listening_on_port "$local_port"; then
+      echo "  OK backend 127.0.0.1:$local_port is listening for $sni"
+    else
+      echo "  WARN backend 127.0.0.1:$local_port is not listening for $sni"
+    fi
+  done
 }
 
 while [[ $# -gt 0 ]]; do
@@ -1080,10 +718,7 @@ done
 
 need_root
 ensure_base_packages
-ensure_jq
-ensure_curl
 discover_auto_nodes
-
 [[ "${#NODES[@]}" -gt 0 ]] || die "no node was provided"
 validate_routes
 
@@ -1093,7 +728,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 install_v2node_if_requested "$tmp_dir"
 run_attach_helper "$tmp_dir"
 ensure_nginx
-ensure_nginx_stream_module
+enable_nginx_stream_module
 ensure_nginx_stream_include
 write_nginx_mux_config
 reload_nginx
